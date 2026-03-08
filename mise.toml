@@ -1,0 +1,35 @@
+[tools]
+rust = ["stable", "nightly"]
+"cargo:bpf-linker" = "latest"
+"cargo:cargo-generate" = "latest"
+"aqua:libbpf/bpftool" = "latest"
+
+[env]
+RUST_LOG = "info"
+
+[tasks.add-bpf-targets]
+description = "Add BPF compilation targets to the nightly toolchain"
+run = [
+  "rustup target add bpfel-unknown-none --toolchain nightly",
+  "rustup target add bpfeb-unknown-none --toolchain nightly",
+]
+
+[tasks.setup]
+description = "Full project setup — install tools and add BPF targets"
+depends = ["add-bpf-targets"]
+
+[tasks.new]
+description = "Scaffold a new aya project from the official template"
+run = "cargo generate --git https://github.com/aya-rs/aya-template"
+
+[tasks.build]
+description = "Build the userspace application"
+run = "cargo build"
+
+[tasks.build-ebpf]
+description = "Build the eBPF program (little-endian target)"
+run = "cargo build -Z build-std=core --target bpfel-unknown-none --release"
+
+[tasks.run]
+description = "Run the application (requires root for BPF loading)"
+run = "sudo -E cargo xtask run"

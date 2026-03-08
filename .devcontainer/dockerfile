@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=mcr.microsoft.com/devcontainers/base:bookworm
+FROM ${BASE_IMAGE}
+
+ARG USERNAME=vscode
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Install baseline tooling required by mise, Rust, and general development
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        unzip \
+        xz-utils \
+        pkg-config \
+        libssl-dev \
+        clang \
+        lld && \
+        rm -rf /var/lib/apt/lists/*
+
+# Ensure the non-root user owns their home directories that mise will populate
+RUN usermod --shell /bin/bash ${USERNAME} \
+    && mkdir -p /home/${USERNAME}/.local/share/mise/shims \
+    && chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.local
+
+USER ${USERNAME}
+
+RUN curl -fsSL https://mise.run | sh
+
+ENV PATH="/home/${USERNAME}/.local/share/mise/shims:/home/${USERNAME}/.local/bin:${PATH}" \
+    MISE_ENV=devcontainer
+
+# Pre-create mise config directory so postCreateCommand can run non-interactively
+RUN mkdir -p /home/${USERNAME}/.config/mise
+
+USER root
