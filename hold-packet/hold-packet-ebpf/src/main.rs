@@ -24,12 +24,12 @@ fn try_hold_packet(ctx: TcContext) -> Result<i32, ()> {
 
     let ipv4hdr: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
     let destination = u32::from_be_bytes(ipv4hdr.dst_addr);
+    let source = u32::from_be_bytes(ipv4hdr.src_addr);
 
-
-    info!(&ctx, "DEST {:i}", destination);
+    info!(&ctx, "DEST {:i}, SRC {:i}", destination, source);
 
     Ok(TC_ACT_PIPE)
-
+    
 }
 // fn try_tc_egress(ctx: TcContext) -> Result<i32, ()> {
 //     let ethhdr: EthHdr = ctx.load(0).map_err(|_| ())?;

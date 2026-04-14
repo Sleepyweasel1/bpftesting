@@ -16,7 +16,7 @@ run = [
 
 [tasks.setup]
 description = "Full project setup — install tools and add BPF targets"
-depends = ["add-bpf-targets", "install-latest-bpftool"]
+depends = ["add-bpf-targets", "install-latest-bpftool", "mount-trace-debug-fs"]
 
 [tasks.new]
 description = "Scaffold a new aya project from the official template"

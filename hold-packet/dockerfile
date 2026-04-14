@@ -1,0 +1,67 @@
+# Build stage with cargo-chef for better layer caching
+# Builder always runs natively on BUILDPLATFORM; cross-compiles for TARGETPLATFORM
+FROM --platform=$BUILDPLATFORM lukemathwalker/cargo-chef:latest-rust-1.94.0-slim-bookworm AS chef
+WORKDIR /app
+
+# Install system dependencies
+FROM --platform=$BUILDPLATFORM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM --platform=$BUILDPLATFORM chef AS builder
+ARG TARGETARCH
+ARG BUILDPLATFORM
+
+# Map Docker arch to Rust target triple
+RUN case "$TARGETARCH" in \
+    amd64) echo "x86_64-unknown-linux-gnu"  > /rust_target ;; \
+    arm64) echo "aarch64-unknown-linux-gnu" > /rust_target ;; \
+    *)     echo "Unsupported arch: $TARGETARCH" >&2 && exit 1 ;; \
+    esac
+
+# Install build dependencies; gcc-aarch64-linux-gnu provides the ARM64 cross-linker
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    pkg-config \
+    clang \
+    lld \
+    gcc-aarch64-linux-gnu && \
+    rm -rf /var/lib/apt/lists/*
+
+# Add ARM64 Rust target for cross-compilation (no-op for native ARM64 builds)
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# Required by hold-packet-ebpf/build.rs and aya eBPF linking.
+RUN cargo install --locked bpf-linker
+
+# Required by aya_build for compiling the eBPF crate.
+RUN rustup toolchain install nightly --component rust-src
+
+# Copy cargo config for build optimizations (lld linker, etc.)
+COPY .cargo/config.toml /app/.cargo/config.toml
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN RUST_TARGET=$(cat /rust_target) && \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo chef cook --release --recipe-path recipe.json --target "$RUST_TARGET"
+
+# Build application with optimizations
+# The release profile in Cargo.toml handles: thin LTO, strip, opt-level=3
+COPY . .
+RUN RUST_TARGET=$(cat /rust_target) && \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --release -p hold-packet --target "$RUST_TARGET" && \
+    cp "target/$RUST_TARGET/release/hold-packet" /hold-packet
+
+# Runtime stage with distroless for security
+FROM gcr.io/distroless/cc-debian12:nonroot
+WORKDIR /app
+
+# distroless nonroot image already runs as nonroot user
+USER nonroot:nonroot
+
+# Copy binary; configuration must be provided at runtime via mounted volume or environment overrides
+COPY --from=builder /hold-packet ./hold-packet
+
+# Use exec form for proper signal handling
+ENTRYPOINT ["./hold-packet"]

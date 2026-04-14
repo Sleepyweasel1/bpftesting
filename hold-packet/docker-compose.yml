@@ -1,0 +1,26 @@
+services:
+  hold-packet:
+    build:
+      context: .
+      dockerfile: dockerfile
+    image: hold-packet:latest
+    container_name: hold-packet
+    environment:
+      - RUST_LOG=info
+    user: "0:0"
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - BPF
+      - PERFMON
+      - NET_ADMIN
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp/hold-packet-seccomp.json
+    command: ["--iface", "${HOLD_PACKET_IFACE:-eth0}"]
+    restart: "no"
