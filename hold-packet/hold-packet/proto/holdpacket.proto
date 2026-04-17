@@ -3,7 +3,7 @@ syntax = "proto3";
 package holdpacket;
 
 // Manages the eBPF BLOCKLIST map on a single node.
-service BlocklistService {
+service CapturelistService {
     rpc AddRule (AddRuleRequest) returns (RuleResponse);
     rpc RemoveRule (RemoveRuleRequest) returns (RuleResponse);
     rpc ListRules (ListRulesRequest) returns (ListRulesResponse);

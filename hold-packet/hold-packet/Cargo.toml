@@ -20,11 +20,13 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
     "sync",
+    "time",
 ] }
 clap = { workspace = true, features = ["derive"] }
 tonic = "0.14.5"
 prost = "0.14.3"
 tonic-prost = "0.14.5"
+tun = { version = "0.8.7", features = ["async"] }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

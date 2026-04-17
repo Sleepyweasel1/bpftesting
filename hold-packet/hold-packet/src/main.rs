@@ -10,9 +10,9 @@ use log::{debug, warn};
 use tokio::sync::Mutex;
 use tonic::transport::Server;
 
-use grpc::BlocklistServer;
-use holdpacket::blocklist_service_server::BlocklistServiceServer;
-
+use grpc::CapturelistServer;
+use holdpacket::capturelist_service_server::CapturelistServiceServer;
+mod replay;
 mod grpc;
 
 pub mod holdpacket {
@@ -77,23 +77,25 @@ async fn main() -> anyhow::Result<()> {
     program.load()?;
     program.attach_with_options(&iface, TcAttachType::Ingress, tc::TcAttachOptions::TcxOrder(LinkOrder::first()))?;
 
-    // Take ownership of the BLOCKLIST map so it can be shared with the gRPC service.
-    let blocklist_map = ebpf
-        .take_map("BLOCKLIST")
-        .expect("BLOCKLIST map not found");
-    let blocklist: HashMap<_, u32, u32> = HashMap::try_from(blocklist_map)?;
+    // Take ownership of the CAPTURELIST map so it can be shared with the gRPC service.
+    let capturelistv6_map = ebpf
+        .take_map("CAPTURELISTV6")
+        .expect("CAPTURELISTV6 map not found");
+    let capturelistv6: HashMap<_, u128, u32> = HashMap::try_from(capturelistv6_map)?;
+    let capturelistv4_map = ebpf
+        .take_map("CAPTURELISTV4")
+        .expect("CAPTURELISTV4 map not found");
+    let capturelistv4: HashMap<_, u32, u32> = HashMap::try_from(capturelistv4_map)?;
 
-    let block_addr: u32 = Ipv4Addr::new(142, 250, 9, 139).into();
+    let shared_capturelistv6 = Arc::new(Mutex::new(capturelistv6));
+    let shared_capturelistv4 = Arc::new(Mutex::new(capturelistv4));
 
-    let shared_blocklist = Arc::new(Mutex::new(blocklist));
-
-    // Insert the initial hardcoded block rule.
-    shared_blocklist.lock().await.insert(block_addr, 0, 0)?;
 
     // Start the gRPC control-plane server.
     let grpc_addr = grpc_addr.parse()?;
-    let svc = BlocklistServiceServer::new(BlocklistServer {
-        blocklist: shared_blocklist,
+    let svc = CapturelistServiceServer::new(CapturelistServer {
+        capturelist_v6: shared_capturelistv6,
+        capturelist_v4: shared_capturelistv4,
     });
     tokio::task::spawn(async move {
         if let Err(e) = Server::builder().add_service(svc).serve(grpc_addr).await {
