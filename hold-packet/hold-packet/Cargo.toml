@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 hold-packet-common = { path = "../hold-packet-common", features = ["user"] }
-
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
@@ -20,8 +19,12 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "sync",
 ] }
 clap = { workspace = true, features = ["derive"] }
+tonic = "0.14.5"
+prost = "0.14.3"
+tonic-prost = "0.14.5"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -39,6 +42,8 @@ cargo_metadata = { workspace = true }
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
 hold-packet-ebpf = { path = "../hold-packet-ebpf" }
+tonic-build = "0.14.5"
+tonic-prost-build = "0.14.5"
 
 [[bin]]
 name = "hold-packet"

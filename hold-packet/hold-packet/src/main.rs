@@ -1,13 +1,30 @@
-use aya::programs::{SchedClassifier, TcAttachType, tc};
+use std::{net::Ipv4Addr, sync::Arc};
+
+use aya::{
+    maps::HashMap,
+    programs::{LinkOrder, SchedClassifier, TcAttachType, tc},
+};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
+use tokio::sync::Mutex;
+use tonic::transport::Server;
+
+use grpc::BlocklistServer;
+use holdpacket::blocklist_service_server::BlocklistServiceServer;
+
+mod grpc;
+
+pub mod holdpacket {
+    tonic::include_proto!("holdpacket");
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "eth0")]
     iface: String,
+    #[clap(long, default_value = "[::]:50051")]
+    grpc_addr: String,
 }
 
 #[tokio::main]
@@ -52,17 +69,41 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface } = opt;
+    let Opt { iface, grpc_addr } = opt;
     // error adding clsact to the interface if it is already added is harmless
     // the full cleanup can be done with 'sudo tc qdisc del dev eth0 clsact'.
-    let _ = tc::qdisc_add_clsact(&iface);
+    // let _ = tc::qdisc_add_clsact(&iface);
     let program: &mut SchedClassifier = ebpf.program_mut("hold_packet").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, TcAttachType::Ingress)?;
+    program.attach_with_options(&iface, TcAttachType::Ingress, tc::TcAttachOptions::TcxOrder(LinkOrder::first()))?;
 
-    let ctrl_c = signal::ctrl_c();
+    // Take ownership of the BLOCKLIST map so it can be shared with the gRPC service.
+    let blocklist_map = ebpf
+        .take_map("BLOCKLIST")
+        .expect("BLOCKLIST map not found");
+    let blocklist: HashMap<_, u32, u32> = HashMap::try_from(blocklist_map)?;
+
+    let block_addr: u32 = Ipv4Addr::new(142, 250, 9, 139).into();
+
+    let shared_blocklist = Arc::new(Mutex::new(blocklist));
+
+    // Insert the initial hardcoded block rule.
+    shared_blocklist.lock().await.insert(block_addr, 0, 0)?;
+
+    // Start the gRPC control-plane server.
+    let grpc_addr = grpc_addr.parse()?;
+    let svc = BlocklistServiceServer::new(BlocklistServer {
+        blocklist: shared_blocklist,
+    });
+    tokio::task::spawn(async move {
+        if let Err(e) = Server::builder().add_service(svc).serve(grpc_addr).await {
+            eprintln!("gRPC server error: {e}");
+        }
+    });
+    log::info!("gRPC server listening on {grpc_addr}");
+
     println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
+    tokio::signal::ctrl_c().await?;
     println!("Exiting...");
 
     Ok(())

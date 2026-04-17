@@ -1,5 +1,6 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
+use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
@@ -23,5 +24,12 @@ fn main() -> anyhow::Result<()> {
             .as_str(),
         ..Default::default()
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    aya_build::build_ebpf([ebpf_package], Toolchain::default())?;
+
+    // Compile the gRPC protobuf definitions.
+    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
+    tonic_prost_build::compile_protos(proto_dir.join("holdpacket.proto"))
+        .context("tonic_prost_build::compile_protos")?;
+
+    Ok(())
 }

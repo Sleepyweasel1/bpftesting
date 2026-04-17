@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package holdpacket;
+
+// Manages the eBPF BLOCKLIST map on a single node.
+service BlocklistService {
+    rpc AddRule (AddRuleRequest) returns (RuleResponse);
+    rpc RemoveRule (RemoveRuleRequest) returns (RuleResponse);
+    rpc ListRules (ListRulesRequest) returns (ListRulesResponse);
+}
+
+message AddRuleRequest {
+    // IPv4 address in dotted-decimal notation, e.g. "192.168.1.1"
+    string ip = 1;
+}
+
+message RemoveRuleRequest {
+    string ip = 1;
+}
+
+message RuleResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListRulesRequest {}
+
+message ListRulesResponse {
+    repeated string ips = 1;
+}
