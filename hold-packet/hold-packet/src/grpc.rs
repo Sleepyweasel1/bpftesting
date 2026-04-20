@@ -3,15 +3,15 @@
 use aya::maps::{HashMap as BpfHashMap, MapData};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-
+use hold_packet_common::StateEntry;
 use crate::holdpacket::{
     capturelist_service_server::CapturelistService, AddRuleRequest, ListRulesRequest,
     ListRulesResponse, RemoveRuleRequest, RuleResponse,
 };
 
 pub struct CapturelistServer {
-    pub capturelist_v4: Arc<Mutex<BpfHashMap<MapData, u32, u32>>>,
-    pub capturelist_v6: Arc<Mutex<BpfHashMap<MapData, u128, u32>>>,
+    pub state_v4: Arc<Mutex<BpfHashMap<MapData, u32, StateEntry>>>,
+    pub state_v6: Arc<Mutex<BpfHashMap<MapData, u128, StateEntry>>>,
 }
 
 #[tonic::async_trait]
@@ -26,12 +26,12 @@ impl CapturelistService for CapturelistServer {
         match ip {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
-                self.capturelist_v4.lock().await.insert(addr, 0, 0)
+                self.state_v4.lock().await.insert(addr, StateEntry::default(), 0)
                     .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
             }
             IpAddr::V6(v6) => {
                 let addr: u128 = v6.into();
-                self.capturelist_v6.lock().await.insert(addr, 0, 0)
+                self.state_v6.lock().await.insert(addr, StateEntry::default(), 0)
                     .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
             }
         }        
@@ -51,12 +51,12 @@ impl CapturelistService for CapturelistServer {
         match ip {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
-                self.capturelist_v4.lock().await.remove(&addr)
+                self.state_v4.lock().await.remove(&addr)
                     .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
             }
             IpAddr::V6(v6) => {
                 let addr: u128 = v6.into();
-                self.capturelist_v6.lock().await.remove(&addr)
+                self.state_v6.lock().await.remove(&addr)
                     .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
             }
         }
@@ -71,13 +71,13 @@ impl CapturelistService for CapturelistServer {
         &self,
         _request: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        let v4_map = self.capturelist_v4.lock().await;
+        let v4_map = self.state_v4.lock().await;
         let mut ips: Vec<String> = v4_map
             .keys()
             .filter_map(|r| r.ok())
             .map(|addr| Ipv4Addr::from(addr).to_string())
             .collect();
-        let v6_map = self.capturelist_v6.lock().await;
+        let v6_map = self.state_v6.lock().await;
         let ips_v6: Vec<String> = v6_map
             .keys()
             .filter_map(|r| r.ok())

@@ -5,17 +5,14 @@ use core::u128;
 
 use aya_ebpf::{EbpfContext, bindings::tcx_action_base::*, helpers::{bpf_ktime_get_ns, generated::{bpf_clone_redirect, bpf_redirect}}, macros::{classifier, map}, maps::{Array, HashMap}, programs::TcContext};
 use aya_log_ebpf::info;
+use hold_packet_common::StateEntry;
 use network_types::{eth::{EthHdr, EtherType}, ip::Ipv4Hdr, ip::Ipv6Hdr};
 
 
 #[map]
-static CAPTURELISTV4: HashMap<u32, u64> = HashMap::with_max_entries(1024, 0);
+static STATEV4: HashMap<u32, StateEntry> = HashMap::with_max_entries(1024, 0);
 #[map]
-static CAPTURELISTV6: HashMap<u128, u64> = HashMap::with_max_entries(1024, 0);
-#[map]
-static REPLAYLISTV6: HashMap<u128, bool> = HashMap::with_max_entries(1024 * 10, 0);
-#[map]
-static REPLAYLISTV4: HashMap<u32, bool> = HashMap::with_max_entries(1024 * 10, 0);
+static STATEV6: HashMap<u128, StateEntry> = HashMap::with_max_entries(1024, 0);
 #[map]
 static TAP_IFINDEX: Array<u32> = Array::with_max_entries(1, 0);
 
@@ -42,26 +39,26 @@ fn redirect_to_tap() -> i32 {
 
 fn replay_v6 (address: u128) -> bool {
     unsafe { 
-        if let Some(replay) = REPLAYLISTV6.get(&address) {
-            return *replay;
+        if let Some(replay) = STATEV6.get(&address) {
+            return replay.replay != 0;
         }
     }
     false
 }
 fn replay_v4 (address: u32) -> bool {
     unsafe { 
-        if let Some(replay) = REPLAYLISTV4.get(&address) {
-            return *replay;
+        if let Some(replay) = STATEV4.get(&address) {
+            return replay.replay != 0;
         }
     }
     false
 }
 
 fn capture_ipv6(address: u128) -> bool {
-    unsafe { CAPTURELISTV6.get(&address).is_some() }
+    unsafe { STATEV6.get(&address).is_some() }
 }
 fn capture_ipv4(address: u32) -> bool {
-    unsafe { CAPTURELISTV4.get(&address).is_some() }
+    unsafe { STATEV4.get(&address).is_some() }
 }
 fn try_hold_packet(ctx: TcContext) -> Result<i32, ()> {
     if is_replayed(&ctx) {
@@ -78,8 +75,8 @@ fn try_hold_packet(ctx: TcContext) -> Result<i32, ()> {
             let source = u32::from_be_bytes(ipv4hdr.src_addr);
             if capture_ipv4(destination) {
                 info!(&ctx, "DEST {:i}, SRC {:i}, TS {}", destination, source, timestamp);
-                if let Some(ts) =  CAPTURELISTV4.get_ptr_mut(&destination) {
-                    unsafe { *ts = bpf_ktime_get_ns() };
+                if let Some(ts) =  STATEV4.get_ptr_mut(&destination) {
+                    unsafe { (*ts).last_seen_ns = bpf_ktime_get_ns() };
                 }
                 if replay_v4(destination) {
                     return Ok(redirect_to_tap());
@@ -91,8 +88,8 @@ fn try_hold_packet(ctx: TcContext) -> Result<i32, ()> {
             let destination = u128::from_be_bytes(ipv6hdr.dst_addr);
             if capture_ipv6(destination) {
                 info!(&ctx, "IPv6 destination to capture, TS {}", timestamp);
-                if let Some(ts) =  CAPTURELISTV6.get_ptr_mut(&destination) {
-                    unsafe { *ts = bpf_ktime_get_ns() };
+                if let Some(ts) =  STATEV6.get_ptr_mut(&destination) {
+                    unsafe { (*ts).last_seen_ns = bpf_ktime_get_ns() };
                 }
                 if replay_v6(destination) {
                     return Ok(redirect_to_tap());

@@ -10,6 +10,7 @@ default = []
 user = ["aya"]
 
 [dependencies]
+aya-ebpf = { workspace = true }
 aya = { workspace = true, optional = true }
 
 [lib]

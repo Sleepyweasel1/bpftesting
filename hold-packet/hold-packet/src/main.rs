@@ -1,13 +1,15 @@
 use std::{net::Ipv4Addr, sync::Arc};
 
 use aya::{
-    maps::HashMap,
+    maps::{HashMap, MapData},
     programs::{LinkOrder, SchedClassifier, TcAttachType, tc},
 };
 use clap::Parser;
+use hold_packet_common::StateEntry;
 #[rustfmt::skip]
 use log::{debug, warn};
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 use tonic::transport::Server;
 
 use grpc::CapturelistServer;
@@ -25,6 +27,11 @@ struct Opt {
     iface: String,
     #[clap(long, default_value = "[::]:50051")]
     grpc_addr: String,
+/// Seconds of inactivity before an IP is flagged for replay (service has scaled
+    /// to zero). Once flagged, new inbound connections are redirected to the tap so
+    /// the service can be woken up. Defaults to 300 s (5 minutes).
+    #[clap(long, default_value = "300")]
+    idle_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -69,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    let Opt { iface, grpc_addr } = opt;
+    let Opt { iface, grpc_addr, idle_timeout_secs } = opt;
     // error adding clsact to the interface if it is already added is harmless
     // the full cleanup can be done with 'sudo tc qdisc del dev eth0 clsact'.
     // let _ = tc::qdisc_add_clsact(&iface);
@@ -78,24 +85,47 @@ async fn main() -> anyhow::Result<()> {
     program.attach_with_options(&iface, TcAttachType::Ingress, tc::TcAttachOptions::TcxOrder(LinkOrder::first()))?;
 
     // Take ownership of the CAPTURELIST map so it can be shared with the gRPC service.
+
+    //TODO: simplify all this to the new StateEntry
     let capturelistv6_map = ebpf
         .take_map("CAPTURELISTV6")
         .expect("CAPTURELISTV6 map not found");
-    let capturelistv6: HashMap<_, u128, u32> = HashMap::try_from(capturelistv6_map)?;
+    let capturelistv6: HashMap<_, u128, u64> = HashMap::try_from(capturelistv6_map)?;
     let capturelistv4_map = ebpf
         .take_map("CAPTURELISTV4")
         .expect("CAPTURELISTV4 map not found");
-    let capturelistv4: HashMap<_, u32, u32> = HashMap::try_from(capturelistv4_map)?;
+    let capturelistv4: HashMap<_, u32, u64> = HashMap::try_from(capturelistv4_map)?;
 
     let shared_capturelistv6 = Arc::new(Mutex::new(capturelistv6));
     let shared_capturelistv4 = Arc::new(Mutex::new(capturelistv4));
 
+    let replaylistv4_map = ebpf
+        .take_map("REPLAYLISTV4")
+        .expect("REPLAYLISTV4 map not found");
+    let replaylistv4: HashMap<_, u32, StateEntry> = HashMap::try_from(replaylistv4_map)?;
+    let replaylistv6_map = ebpf
+        .take_map("REPLAYLISTV6")
+        .expect("REPLAYLISTV6 map not found");
+    let replaylistv6: HashMap<_, u128, StateEntry> = HashMap::try_from(replaylistv6_map)?;
+
+    let shared_replaylistv4 = Arc::new(Mutex::new(replaylistv4));
+    let shared_replaylistv6 = Arc::new(Mutex::new(replaylistv6));
+
+    spawn_idle_monitor(
+        Arc::clone(&shared_capturelistv4),
+        Arc::clone(&shared_capturelistv6),
+        Arc::clone(&shared_replaylistv4),
+        Arc::clone(&shared_replaylistv6),
+        idle_timeout_secs,
+    );
 
     // Start the gRPC control-plane server.
     let grpc_addr = grpc_addr.parse()?;
     let svc = CapturelistServiceServer::new(CapturelistServer {
         capturelist_v6: shared_capturelistv6,
         capturelist_v4: shared_capturelistv4,
+        replaylist_v4: shared_replaylistv4,
+        replaylist_v6: shared_replaylistv6,
     });
     tokio::task::spawn(async move {
         if let Err(e) = Server::builder().add_service(svc).serve(grpc_addr).await {
@@ -109,4 +139,112 @@ async fn main() -> anyhow::Result<()> {
     println!("Exiting...");
 
     Ok(())
+}
+
+/// Returns the current CLOCK_MONOTONIC time in nanoseconds, matching the
+/// clock used by `bpf_ktime_get_ns()` in the eBPF program.
+fn current_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Spawns a background task that iterates over the capture-list maps every 30 s.
+///
+/// **Idle → scale-to-zero**: if an IP's last-seen timestamp is non-zero and
+/// older than `idle_timeout_secs`, its replay-list entry is set to `true`.
+/// The capture-list entry is kept so the eBPF program continues capturing
+/// packets (which will now be redirected to the tap to wake the service).
+///
+/// **Active → service restored**: if an IP is currently in the replay list
+/// but its timestamp has been updated within the idle window, the replay
+/// flag is cleared (`false` / removed) so normal forwarding resumes.
+fn spawn_idle_monitor(
+    capturelist_v4: Arc<Mutex<HashMap<MapData, u32, u64>>>,
+    capturelist_v6: Arc<Mutex<HashMap<MapData, u128, u64>>>,
+    replaylist_v4: Arc<Mutex<HashMap<MapData, u32, u8>>>,
+    replaylist_v6: Arc<Mutex<HashMap<MapData, u128, u8>>>,
+    idle_timeout_secs: u64,
+) {
+    let idle_timeout_ns = idle_timeout_secs.saturating_mul(1_000_000_000);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            let now_ns = current_monotonic_ns();
+
+            // --- IPv4 ---
+            let entries_v4: Vec<(u32, u64)> = capturelist_v4
+                .lock()
+                .await
+                .iter()
+                .filter_map(|r| r.ok())
+                .collect();
+            for (addr, ts) in entries_v4 {
+                let idle = ts > 0 && now_ns.saturating_sub(ts) >= idle_timeout_ns;
+                if idle {
+                    // Traffic has stopped — flag this IP for replay so new
+                    // connections are held and the service can be woken up.
+                    log::info!(
+                        "idle-monitor: IPv4 {} idle for >{}s, enabling replay (scale-to-zero)",
+                        std::net::Ipv4Addr::from(addr),
+                        idle_timeout_secs
+                    );
+                    let _ = replaylist_v4.lock().await.insert(addr, 1u8, 0);
+                } else {
+                    // Traffic is flowing — if the replay flag is set, clear it
+                    // because the service is back up.
+                    let currently_replaying = replaylist_v4
+                        .lock()
+                        .await
+                        .get(&addr, 0)
+                        .ok()
+                        .unwrap_or(0) != 0;
+                    if currently_replaying {
+                        log::info!(
+                            "idle-monitor: IPv4 {} traffic resumed, disabling replay",
+                            std::net::Ipv4Addr::from(addr)
+                        );
+                        let _ = replaylist_v4.lock().await.remove(&addr);
+                    }
+                }
+            }
+
+            // --- IPv6 ---
+            let entries_v6: Vec<(u128, u64)> = capturelist_v6
+                .lock()
+                .await
+                .iter()
+                .filter_map(|r| r.ok())
+                .collect();
+            for (addr, ts) in entries_v6 {
+                let idle = ts > 0 && now_ns.saturating_sub(ts) >= idle_timeout_ns;
+                if idle {
+                    log::info!(
+                        "idle-monitor: IPv6 {} idle for >{}s, enabling replay (scale-to-zero)",
+                        std::net::Ipv6Addr::from(addr),
+                        idle_timeout_secs
+                    );
+                    let _ = replaylist_v6.lock().await.insert(addr, 1u8, 0);
+                } else {
+                    let currently_replaying = replaylist_v6
+                        .lock()
+                        .await
+                        .get(&addr, 0)
+                        .ok()
+                        .unwrap_or(0) != 0;
+                    if currently_replaying {
+                        log::info!(
+                            "idle-monitor: IPv6 {} traffic resumed, disabling replay",
+                            std::net::Ipv6Addr::from(addr)
+                        );
+                        let _ = replaylist_v6.lock().await.remove(&addr);
+                    }
+                }
+            }
+        }
+    });
 }
