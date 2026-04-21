@@ -3,7 +3,7 @@
 
 use core::u128;
 
-use aya_ebpf::{EbpfContext, bindings::tcx_action_base::*, helpers::{bpf_ktime_get_ns, generated::{bpf_clone_redirect, bpf_redirect}}, macros::{classifier, map}, maps::{Array, HashMap}, programs::TcContext};
+use aya_ebpf::{bindings::tcx_action_base::*, helpers::{bpf_ktime_get_ns, generated::{bpf_redirect}}, macros::{classifier, map}, maps::{Array, HashMap}, programs::TcContext};
 use aya_log_ebpf::info;
 use hold_packet_common::StateEntry;
 use network_types::{eth::{EthHdr, EtherType}, ip::Ipv4Hdr, ip::Ipv6Hdr};

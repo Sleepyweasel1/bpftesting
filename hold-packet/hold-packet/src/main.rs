@@ -87,35 +87,21 @@ async fn main() -> anyhow::Result<()> {
     // Take ownership of the CAPTURELIST map so it can be shared with the gRPC service.
 
     //TODO: simplify all this to the new StateEntry
-    let capturelistv6_map = ebpf
-        .take_map("CAPTURELISTV6")
-        .expect("CAPTURELISTV6 map not found");
-    let capturelistv6: HashMap<_, u128, u64> = HashMap::try_from(capturelistv6_map)?;
-    let capturelistv4_map = ebpf
-        .take_map("CAPTURELISTV4")
-        .expect("CAPTURELISTV4 map not found");
-    let capturelistv4: HashMap<_, u32, u64> = HashMap::try_from(capturelistv4_map)?;
+    let statelistv6_map = ebpf
+        .take_map("STATEV6")
+        .expect("STATEV6 map not found");
+    let statelistv6: HashMap<_, u128, StateEntry> = HashMap::try_from(statelistv6_map)?;
+    let statelistv4_map = ebpf
+        .take_map("STATEV4")
+        .expect("STATEV4 map not found");
+    let statelistv4: HashMap<_, u32, StateEntry> = HashMap::try_from(statelistv4_map)?;
 
-    let shared_capturelistv6 = Arc::new(Mutex::new(capturelistv6));
-    let shared_capturelistv4 = Arc::new(Mutex::new(capturelistv4));
+    let shared_statelistv6 = Arc::new(Mutex::new(statelistv6));
+    let shared_statelistv4 = Arc::new(Mutex::new(statelistv4));
 
-    let replaylistv4_map = ebpf
-        .take_map("REPLAYLISTV4")
-        .expect("REPLAYLISTV4 map not found");
-    let replaylistv4: HashMap<_, u32, StateEntry> = HashMap::try_from(replaylistv4_map)?;
-    let replaylistv6_map = ebpf
-        .take_map("REPLAYLISTV6")
-        .expect("REPLAYLISTV6 map not found");
-    let replaylistv6: HashMap<_, u128, StateEntry> = HashMap::try_from(replaylistv6_map)?;
-
-    let shared_replaylistv4 = Arc::new(Mutex::new(replaylistv4));
-    let shared_replaylistv6 = Arc::new(Mutex::new(replaylistv6));
 
     spawn_idle_monitor(
-        Arc::clone(&shared_capturelistv4),
-        Arc::clone(&shared_capturelistv6),
-        Arc::clone(&shared_replaylistv4),
-        Arc::clone(&shared_replaylistv6),
+        Arc::clone(&shared_statelistv4);
         idle_timeout_secs,
     );
 
@@ -163,10 +149,8 @@ fn current_monotonic_ns() -> u64 {
 /// but its timestamp has been updated within the idle window, the replay
 /// flag is cleared (`false` / removed) so normal forwarding resumes.
 fn spawn_idle_monitor(
-    capturelist_v4: Arc<Mutex<HashMap<MapData, u32, u64>>>,
-    capturelist_v6: Arc<Mutex<HashMap<MapData, u128, u64>>>,
-    replaylist_v4: Arc<Mutex<HashMap<MapData, u32, u8>>>,
-    replaylist_v6: Arc<Mutex<HashMap<MapData, u128, u8>>>,
+    statelist_v4: Arc<Mutex<HashMap<MapData, u32, StateEntry>>>,
+    statelist_v6: Arc<Mutex<HashMap<MapData, u128, StateEntry>>>,
     idle_timeout_secs: u64,
 ) {
     let idle_timeout_ns = idle_timeout_secs.saturating_mul(1_000_000_000);
@@ -177,14 +161,14 @@ fn spawn_idle_monitor(
             let now_ns = current_monotonic_ns();
 
             // --- IPv4 ---
-            let entries_v4: Vec<(u32, u64)> = capturelist_v4
+            let entries_v4: Vec<(u32, StateEntry)> = statelist_v4
                 .lock()
                 .await
                 .iter()
                 .filter_map(|r| r.ok())
                 .collect();
             for (addr, ts) in entries_v4 {
-                let idle = ts > 0 && now_ns.saturating_sub(ts) >= idle_timeout_ns;
+                let idle = ts.last_seen_ns > 0 && now_ns.saturating_sub(ts.last_seen_ns) >= idle_timeout_ns;
                 if idle {
                     // Traffic has stopped — flag this IP for replay so new
                     // connections are held and the service can be woken up.
