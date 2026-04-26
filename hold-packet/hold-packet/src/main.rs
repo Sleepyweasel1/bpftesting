@@ -1,14 +1,14 @@
-use std::{net::Ipv4Addr, sync::Arc};
+use std::{net::{Ipv4Addr, Ipv6Addr}, sync::Arc};
 
 use aya::{
-    maps::{HashMap, MapData},
+    maps::{Array, HashMap, MapData},
     programs::{LinkOrder, SchedClassifier, TcAttachType, tc},
 };
 use clap::Parser;
 use hold_packet_common::StateEntry;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Duration;
 use tonic::transport::Server;
 
@@ -27,7 +27,7 @@ struct Opt {
     iface: String,
     #[clap(long, default_value = "[::]:50051")]
     grpc_addr: String,
-/// Seconds of inactivity before an IP is flagged for replay (service has scaled
+    /// Seconds of inactivity before an IP is flagged for replay (service has scaled
     /// to zero). Once flagged, new inbound connections are redirected to the tap so
     /// the service can be woken up. Defaults to 300 s (5 minutes).
     #[clap(long, default_value = "300")]
@@ -86,7 +86,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Take ownership of the CAPTURELIST map so it can be shared with the gRPC service.
 
-    //TODO: simplify all this to the new StateEntry
     let statelistv6_map = ebpf
         .take_map("STATEV6")
         .expect("STATEV6 map not found");
@@ -95,23 +94,36 @@ async fn main() -> anyhow::Result<()> {
         .take_map("STATEV4")
         .expect("STATEV4 map not found");
     let statelistv4: HashMap<_, u32, StateEntry> = HashMap::try_from(statelistv4_map)?;
-
-    let shared_statelistv6 = Arc::new(Mutex::new(statelistv6));
-    let shared_statelistv4 = Arc::new(Mutex::new(statelistv4));
-
+    let shared_statelistv6 = Arc::new(RwLock::new(statelistv6));
+    let shared_statelistv4 = Arc::new(RwLock::new(statelistv4));
+    let tap_ifindex_map = ebpf
+        .take_map("TAP_IFINDEX")
+        .expect("TAP_IFINDEX map not found");
+    let mut tap_ifindex: Array<_, u32> = Array::try_from(tap_ifindex_map)?;
 
     spawn_idle_monitor(
-        Arc::clone(&shared_statelistv4);
+        Arc::clone(&shared_statelistv4),
+        Arc::clone(&shared_statelistv6),
         idle_timeout_secs,
     );
+    //start the replay task that will replay captured packets for IPs in the replay list
+    let replayer = replay::Replayer::new("tap1")?;
+    tap_ifindex.set(0, replayer.tap_ifindex(), 0)?;
+    //start a task to have the replayer watch for packets sent to the tap
+    // tokio::task::spawn(async move {
+    //     replayer.run().await;
+    // });
+    replayer.spawn_pruner();
+    let replayer =Arc::new(replayer);
+    Arc::clone(&replayer).spawn_runner();
+    //spawn pruner task to have the replayer automatically drop staged packets after the TTL expires
 
     // Start the gRPC control-plane server.
     let grpc_addr = grpc_addr.parse()?;
     let svc = CapturelistServiceServer::new(CapturelistServer {
-        capturelist_v6: shared_capturelistv6,
-        capturelist_v4: shared_capturelistv4,
-        replaylist_v4: shared_replaylistv4,
-        replaylist_v6: shared_replaylistv6,
+            state_v4: Arc::clone(&shared_statelistv4),
+            state_v6: Arc::clone(&shared_statelistv6),
+            replayer: Arc::clone(&replayer),
     });
     tokio::task::spawn(async move {
         if let Err(e) = Server::builder().add_service(svc).serve(grpc_addr).await {
@@ -149,8 +161,8 @@ fn current_monotonic_ns() -> u64 {
 /// but its timestamp has been updated within the idle window, the replay
 /// flag is cleared (`false` / removed) so normal forwarding resumes.
 fn spawn_idle_monitor(
-    statelist_v4: Arc<Mutex<HashMap<MapData, u32, StateEntry>>>,
-    statelist_v6: Arc<Mutex<HashMap<MapData, u128, StateEntry>>>,
+    statelist_v4: Arc<RwLock<HashMap<MapData, u32, StateEntry>>>,
+    statelist_v6: Arc<RwLock<HashMap<MapData, u128, StateEntry>>>,
     idle_timeout_secs: u64,
 ) {
     let idle_timeout_ns = idle_timeout_secs.saturating_mul(1_000_000_000);
@@ -159,76 +171,59 @@ fn spawn_idle_monitor(
         loop {
             ticker.tick().await;
             let now_ns = current_monotonic_ns();
-
-            // --- IPv4 ---
-            let entries_v4: Vec<(u32, StateEntry)> = statelist_v4
-                .lock()
-                .await
-                .iter()
-                .filter_map(|r| r.ok())
-                .collect();
-            for (addr, ts) in entries_v4 {
-                let idle = ts.last_seen_ns > 0 && now_ns.saturating_sub(ts.last_seen_ns) >= idle_timeout_ns;
-                if idle {
-                    // Traffic has stopped — flag this IP for replay so new
-                    // connections are held and the service can be woken up.
-                    log::info!(
-                        "idle-monitor: IPv4 {} idle for >{}s, enabling replay (scale-to-zero)",
-                        std::net::Ipv4Addr::from(addr),
-                        idle_timeout_secs
-                    );
-                    let _ = replaylist_v4.lock().await.insert(addr, 1u8, 0);
-                } else {
-                    // Traffic is flowing — if the replay flag is set, clear it
-                    // because the service is back up.
-                    let currently_replaying = replaylist_v4
-                        .lock()
-                        .await
-                        .get(&addr, 0)
-                        .ok()
-                        .unwrap_or(0) != 0;
-                    if currently_replaying {
-                        log::info!(
-                            "idle-monitor: IPv4 {} traffic resumed, disabling replay",
-                            std::net::Ipv4Addr::from(addr)
-                        );
-                        let _ = replaylist_v4.lock().await.remove(&addr);
-                    }
-                }
+            let updates: Vec<(u32, StateEntry)> = {
+    let v4_map = statelist_v4.read().await;
+    v4_map.iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|(ip, entry)| {
+            if entry.last_seen_ns == 0 { return None; }
+            let idle_time = now_ns.saturating_sub(entry.last_seen_ns);
+            if idle_time > idle_timeout_ns && entry.replay != 1 {
+                Some((ip, StateEntry { replay: 1, ..entry }))
+            } else if idle_time <= idle_timeout_ns && entry.replay == 1 {
+                Some((ip, StateEntry { replay: 0, ..entry }))
+            } else {
+                None
             }
+        })
+        .collect()
+}; // read lock dropped here
 
-            // --- IPv6 ---
-            let entries_v6: Vec<(u128, u64)> = capturelist_v6
-                .lock()
-                .await
-                .iter()
-                .filter_map(|r| r.ok())
-                .collect();
-            for (addr, ts) in entries_v6 {
-                let idle = ts > 0 && now_ns.saturating_sub(ts) >= idle_timeout_ns;
-                if idle {
-                    log::info!(
-                        "idle-monitor: IPv6 {} idle for >{}s, enabling replay (scale-to-zero)",
-                        std::net::Ipv6Addr::from(addr),
-                        idle_timeout_secs
-                    );
-                    let _ = replaylist_v6.lock().await.insert(addr, 1u8, 0);
-                } else {
-                    let currently_replaying = replaylist_v6
-                        .lock()
-                        .await
-                        .get(&addr, 0)
-                        .ok()
-                        .unwrap_or(0) != 0;
-                    if currently_replaying {
-                        log::info!(
-                            "idle-monitor: IPv6 {} traffic resumed, disabling replay",
-                            std::net::Ipv6Addr::from(addr)
-                        );
-                        let _ = replaylist_v6.lock().await.remove(&addr);
-                    }
-                }
+// Write phase — lock held only for brief syscall bursts
+        if !updates.is_empty() {
+            let mut v4_map = statelist_v4.write().await;
+            for (ip, entry) in updates {
+                v4_map.insert(ip, entry, 0).ok();
             }
+        }
+        
+            let updates_v6: Vec<(u128, StateEntry)> = {
+    let v6_map = statelist_v6.read().await;
+    v6_map.iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|(ip, entry)| {
+            if entry.last_seen_ns == 0 { return None; }
+            let idle_time = now_ns.saturating_sub(entry.last_seen_ns);
+            if idle_time > idle_timeout_ns && entry.replay != 1 {
+                Some((ip, StateEntry { replay: 1, ..entry }))
+            } else if idle_time <= idle_timeout_ns && entry.replay == 1 {
+                Some((ip, StateEntry { replay: 0, ..entry }))
+            } else {
+                None
+            }
+        })
+        .collect()
+}; // read lock dropped here
+
+// Write phase — lock held only for brief syscall bursts
+        if !updates_v6.is_empty() {
+            let mut v6_map = statelist_v6.write().await;
+            for (ip, entry) in updates_v6 {
+                v6_map.insert(ip, entry, 0).ok();
+            }
+        }
+
+            
         }
     });
 }

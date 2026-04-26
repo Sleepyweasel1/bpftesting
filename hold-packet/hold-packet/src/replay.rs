@@ -1,3 +1,4 @@
+use core::alloc;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::net::IpAddr;
@@ -79,7 +80,17 @@ impl Replayer {
 
         Ok(id)
     }
-
+    pub fn spawn_runner(self: Arc<Self>) {
+        tokio::task::spawn(async move {
+            self.run().await.expect("replayer run failed");
+        });
+    }
+    async fn run (&self) -> std::io::Result<()> {
+        loop {
+            let id = self.read_and_stage().await?;
+            log::info!("Staged packet with ID {id}");
+        }
+    }
     /// Replays the staged packet with the given ID onto the replay interface
     /// and removes it from the staging map.
     pub async fn replay_staged(&self, id: u64) -> std::io::Result<()> {

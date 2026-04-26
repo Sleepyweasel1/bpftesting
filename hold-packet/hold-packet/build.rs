@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
 
     // Compile the gRPC protobuf definitions.
     let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
+    println!("cargo:rerun-if-changed=proto/holdpacket.proto");
     tonic_prost_build::compile_protos(proto_dir.join("holdpacket.proto"))
         .context("tonic_prost_build::compile_protos")?;
 

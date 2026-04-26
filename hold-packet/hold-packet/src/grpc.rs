@@ -1,17 +1,17 @@
- use std::{net::{IpAddr, Ipv4Addr}, str::FromStr, sync::Arc};
+ use std::{net::{IpAddr, Ipv4Addr}, str::FromStr, sync::{Arc}};
 
 use aya::maps::{HashMap as BpfHashMap, MapData};
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use hold_packet_common::StateEntry;
-use crate::holdpacket::{
-    capturelist_service_server::CapturelistService, AddRuleRequest, ListRulesRequest,
-    ListRulesResponse, RemoveRuleRequest, RuleResponse,
-};
+use crate::{holdpacket::{
+    AddRuleRequest, ListRulesRequest, ListRulesResponse, RemoveRuleRequest, ReplayRuleRequest, RuleResponse, capturelist_service_server::CapturelistService
+}, replay};
+use tokio::sync::RwLock;
 
 pub struct CapturelistServer {
-    pub state_v4: Arc<Mutex<BpfHashMap<MapData, u32, StateEntry>>>,
-    pub state_v6: Arc<Mutex<BpfHashMap<MapData, u128, StateEntry>>>,
+    pub state_v4: Arc<RwLock<BpfHashMap<MapData, u32, StateEntry>>>,
+    pub state_v6: Arc<RwLock<BpfHashMap<MapData, u128, StateEntry>>>,
+    pub replayer: Arc<replay::Replayer>,
 }
 
 #[tonic::async_trait]
@@ -26,12 +26,14 @@ impl CapturelistService for CapturelistServer {
         match ip {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
-                self.state_v4.lock().await.insert(addr, StateEntry::default(), 0)
+                let mut state_v4 = self.state_v4.write().await;
+                state_v4.insert(addr, StateEntry::default(), 0)
                     .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
             }
             IpAddr::V6(v6) => {
                 let addr: u128 = v6.into();
-                self.state_v6.lock().await.insert(addr, StateEntry::default(), 0)
+                let mut state_v6 = self.state_v6.write().await;
+                state_v6.insert(addr, StateEntry::default(), 0)
                     .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
             }
         }        
@@ -51,12 +53,14 @@ impl CapturelistService for CapturelistServer {
         match ip {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
-                self.state_v4.lock().await.remove(&addr)
+                let mut state_v4 = self.state_v4.write().await;
+                state_v4.remove(&addr)
                     .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
             }
             IpAddr::V6(v6) => {
                 let addr: u128 = v6.into();
-                self.state_v6.lock().await.remove(&addr)
+                let mut state_v6 = self.state_v6.write().await;
+                state_v6.remove(&addr)
                     .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
             }
         }
@@ -71,13 +75,13 @@ impl CapturelistService for CapturelistServer {
         &self,
         _request: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        let v4_map = self.state_v4.lock().await;
+        let v4_map = self.state_v4.read().await;
         let mut ips: Vec<String> = v4_map
             .keys()
             .filter_map(|r| r.ok())
             .map(|addr| Ipv4Addr::from(addr).to_string())
             .collect();
-        let v6_map = self.state_v6.lock().await;
+        let v6_map = self.state_v6.read().await;
         let ips_v6: Vec<String> = v6_map
             .keys()
             .filter_map(|r| r.ok())
@@ -89,6 +93,17 @@ impl CapturelistService for CapturelistServer {
             .collect();
         ips.extend(ips_v6);
         Ok(Response::new(ListRulesResponse { ips }))
+    }
+    async fn replay_rule (&self, request: Request<ReplayRuleRequest>) -> Result<Response<RuleResponse>, Status> {
+        let id = request.into_inner().id;
+        self.replayer.replay_staged(id).await
+            .map_err(|e| Status::internal(format!("failed to replay staged packet: {e}")))?;
+        Ok(
+            Response::new(RuleResponse {
+                success: true,
+                error: String::new(),
+            })
+        )
     }
 }
 
