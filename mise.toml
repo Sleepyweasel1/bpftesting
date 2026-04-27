@@ -33,3 +33,23 @@ run = "cargo build -Z build-std=core --target bpfel-unknown-none --release"
 [tasks.run]
 description = "Run the application (requires root for BPF loading)"
 run = "sudo -E cargo xtask run"
+
+[tasks.test-userspace]
+description = "Check userspace code compiles (no privileged eBPF integration test)"
+dir = "hold-packet"
+run = "cargo check"
+
+[tasks.test-ebpf-only]
+description = "Run only eBPF integration tests (requires root and Linux)"
+dir = "hold-packet"
+run = "sudo env PATH=$PATH RUSTUP_TOOLCHAIN=nightly cargo test --test integration_test -- --nocapture"
+
+[tasks.test-e2e]
+description = "Run only userspace black-box E2E replay test (requires root and Linux)"
+dir = "hold-packet"
+run = "sudo env PATH=$PATH RUSTUP_TOOLCHAIN=nightly cargo test --test integration_test test_userspace_replay_blackbox_e2e -- --nocapture"
+
+[tasks.test]
+description = "Run all tests (userspace + eBPF; eBPF tests require root)"
+dir = "hold-packet"
+run = "sudo env PATH=$PATH RUSTUP_TOOLCHAIN=nightly cargo test --test integration_test -- --nocapture"
