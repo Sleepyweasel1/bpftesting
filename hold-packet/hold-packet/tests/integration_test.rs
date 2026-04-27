@@ -1,10 +1,10 @@
 use aya::{
     maps::{HashMap, MapData},
-    programs::{SchedClassifier, TcAttachType, tc},
+    programs::SchedClassifier,
 };
 use hold_packet_common::StateEntry;
 use network_types::{
-    eth::{EthHdr, EtherType},
+    eth::EthHdr,
     ip::Ipv4Hdr,
 };
 
@@ -31,13 +31,13 @@ async fn test_hold_packet_ebpf() {
     let statelistv4_map = ebpf
         .take_map("STATEV4")
         .expect("STATEV4 map not found");
-    let mut statelistv4: HashMap<MapData, u32> = HashMap::try_from(statelistv4_map).unwrap();
+    let mut statelistv4: HashMap<MapData, u32, StateEntry> = HashMap::try_from(statelistv4_map).unwrap();
 
     let test_ip: u32 = u32::from_be_bytes([192, 168, 1, 100]);
     let test_entry = StateEntry {
         replay: 0,
         last_seen_ns: 0,
-        pad: 0,
+        packet_count: 0,
     };
     statelistv4.insert(test_ip, test_entry, 0).expect("Failed to insert map entry");
 
@@ -47,7 +47,7 @@ async fn test_hold_packet_ebpf() {
     // Safety: we zero-initialized the slice, so it's safe to cast to headers
     unsafe {
         let eth = packet.as_mut_ptr() as *mut EthHdr;
-        (*eth).ether_type = EtherType::Ipv4.into();
+        (*eth).ether_type = 0x0800u16.to_be(); // IPv4 EtherType
         
         let ipv4 = packet.as_mut_ptr().add(EthHdr::LEN) as *mut Ipv4Hdr;
         (*ipv4).dst_addr = test_ip.to_be_bytes();
@@ -56,9 +56,7 @@ async fn test_hold_packet_ebpf() {
     // Use test run API
     let res = program.test(&packet, &[]).expect("Failed to run test");
     
-    // 2 is TCX_NEXT (defined in aya_ebpf bindings, typically 2 or equivalent for Tcx)
-    // Actually, Tcx NEXT is usually 2. 
-    // We expect it to pass without error.
+    // 2 is TCX_NEXT
     assert_eq!(res.retval, 2, "Expected TCX_NEXT (2)");
 
     // Verify that last_seen_ns was updated by the eBPF program
