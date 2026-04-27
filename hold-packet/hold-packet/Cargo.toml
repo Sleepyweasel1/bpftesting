@@ -50,3 +50,6 @@ tonic-prost-build = "0.14.5"
 [[bin]]
 name = "hold-packet"
 path = "src/main.rs"
+
+[dev-dependencies]
+network-types = "0.1.0"

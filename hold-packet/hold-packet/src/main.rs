@@ -160,6 +160,26 @@ fn current_monotonic_ns() -> u64 {
 /// **Active → service restored**: if an IP is currently in the replay list
 /// but its timestamp has been updated within the idle window, the replay
 /// flag is cleared (`false` / removed) so normal forwarding resumes.
+pub fn calculate_state_updates<K: Copy>(
+    entries: impl Iterator<Item = (K, StateEntry)>,
+    now_ns: u64,
+    idle_timeout_ns: u64,
+) -> Vec<(K, StateEntry)> {
+    entries
+        .filter_map(|(ip, entry)| {
+            if entry.last_seen_ns == 0 { return None; }
+            let idle_time = now_ns.saturating_sub(entry.last_seen_ns);
+            if idle_time > idle_timeout_ns && entry.replay != 1 {
+                Some((ip, StateEntry { replay: 1, ..entry }))
+            } else if idle_time <= idle_timeout_ns && entry.replay == 1 {
+                Some((ip, StateEntry { replay: 0, ..entry }))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn spawn_idle_monitor(
     statelist_v4: Arc<RwLock<HashMap<MapData, u32, StateEntry>>>,
     statelist_v6: Arc<RwLock<HashMap<MapData, u128, StateEntry>>>,
@@ -171,59 +191,97 @@ fn spawn_idle_monitor(
         loop {
             ticker.tick().await;
             let now_ns = current_monotonic_ns();
+            
             let updates: Vec<(u32, StateEntry)> = {
-    let v4_map = statelist_v4.read().await;
-    v4_map.iter()
-        .filter_map(|r| r.ok())
-        .filter_map(|(ip, entry)| {
-            if entry.last_seen_ns == 0 { return None; }
-            let idle_time = now_ns.saturating_sub(entry.last_seen_ns);
-            if idle_time > idle_timeout_ns && entry.replay != 1 {
-                Some((ip, StateEntry { replay: 1, ..entry }))
-            } else if idle_time <= idle_timeout_ns && entry.replay == 1 {
-                Some((ip, StateEntry { replay: 0, ..entry }))
-            } else {
-                None
-            }
-        })
-        .collect()
-}; // read lock dropped here
+                let v4_map = statelist_v4.read().await;
+                calculate_state_updates(v4_map.iter().filter_map(|r| r.ok()), now_ns, idle_timeout_ns)
+            }; // read lock dropped here
 
-// Write phase — lock held only for brief syscall bursts
-        if !updates.is_empty() {
-            let mut v4_map = statelist_v4.write().await;
-            for (ip, entry) in updates {
-                v4_map.insert(ip, entry, 0).ok();
+            // Write phase — lock held only for brief syscall bursts
+            if !updates.is_empty() {
+                let mut v4_map = statelist_v4.write().await;
+                for (ip, entry) in updates {
+                    v4_map.insert(ip, entry, 0).ok();
+                }
             }
-        }
         
             let updates_v6: Vec<(u128, StateEntry)> = {
-    let v6_map = statelist_v6.read().await;
-    v6_map.iter()
-        .filter_map(|r| r.ok())
-        .filter_map(|(ip, entry)| {
-            if entry.last_seen_ns == 0 { return None; }
-            let idle_time = now_ns.saturating_sub(entry.last_seen_ns);
-            if idle_time > idle_timeout_ns && entry.replay != 1 {
-                Some((ip, StateEntry { replay: 1, ..entry }))
-            } else if idle_time <= idle_timeout_ns && entry.replay == 1 {
-                Some((ip, StateEntry { replay: 0, ..entry }))
-            } else {
-                None
-            }
-        })
-        .collect()
-}; // read lock dropped here
+                let v6_map = statelist_v6.read().await;
+                calculate_state_updates(v6_map.iter().filter_map(|r| r.ok()), now_ns, idle_timeout_ns)
+            }; // read lock dropped here
 
-// Write phase — lock held only for brief syscall bursts
-        if !updates_v6.is_empty() {
-            let mut v6_map = statelist_v6.write().await;
-            for (ip, entry) in updates_v6 {
-                v6_map.insert(ip, entry, 0).ok();
+            // Write phase — lock held only for brief syscall bursts
+            if !updates_v6.is_empty() {
+                let mut v6_map = statelist_v6.write().await;
+                for (ip, entry) in updates_v6 {
+                    v6_map.insert(ip, entry, 0).ok();
+                }
             }
-        }
-
-            
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_state_updates_no_change() {
+        let entries = vec![
+            (1u32, StateEntry { last_seen_ns: 1000, replay: 0, ..unsafe { std::mem::zeroed() } }),
+            (2u32, StateEntry { last_seen_ns: 1000, replay: 1, ..unsafe { std::mem::zeroed() } }),
+        ];
+        // For IP 1, idle time = 2000 - 1000 = 1000, idle_timeout = 2000. Not idle. No change since replay is 0.
+        // For IP 2, idle time = 4000 - 1000 = 3000, idle_timeout = 2000. Idle. No change since replay is already 1.
+        let now_ns = 2000;
+        let idle_timeout_ns = 2000;
+        
+        // Let's test IP 1 separately
+        let updates = calculate_state_updates(vec![entries[0].clone()].into_iter(), now_ns, idle_timeout_ns);
+        assert!(updates.is_empty());
+
+        let now_ns_2 = 4000;
+        let updates = calculate_state_updates(vec![entries[1].clone()].into_iter(), now_ns_2, idle_timeout_ns);
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn test_calculate_state_updates_to_idle() {
+        let entries = vec![
+            (1u32, StateEntry { last_seen_ns: 1000, replay: 0, ..unsafe { std::mem::zeroed() } }),
+        ];
+        let now_ns = 4000;
+        let idle_timeout_ns = 2000;
+        
+        let updates = calculate_state_updates(entries.into_iter(), now_ns, idle_timeout_ns);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1u32);
+        assert_eq!(updates[0].1.replay, 1);
+    }
+
+    #[test]
+    fn test_calculate_state_updates_to_active() {
+        let entries = vec![
+            (1u32, StateEntry { last_seen_ns: 3000, replay: 1, ..unsafe { std::mem::zeroed() } }),
+        ];
+        let now_ns = 4000;
+        let idle_timeout_ns = 2000;
+        
+        let updates = calculate_state_updates(entries.into_iter(), now_ns, idle_timeout_ns);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1u32);
+        assert_eq!(updates[0].1.replay, 0);
+    }
+
+    #[test]
+    fn test_calculate_state_updates_ignore_zero_last_seen() {
+        let entries = vec![
+            (1u32, StateEntry { last_seen_ns: 0, replay: 0, ..unsafe { std::mem::zeroed() } }),
+        ];
+        let now_ns = 4000;
+        let idle_timeout_ns = 2000;
+        
+        let updates = calculate_state_updates(entries.into_iter(), now_ns, idle_timeout_ns);
+        assert!(updates.is_empty());
+    }
 }
