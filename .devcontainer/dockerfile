@@ -29,6 +29,9 @@ USER ${USERNAME}
 
 RUN curl -fsSL https://mise.run | sh
 
+RUN echo 'eval "$(mise activate zsh)"' >> ~/.zshrc
+RUN echo $(mise activate --shims) >> ~/.zshrc
+
 ENV PATH="/home/${USERNAME}/.local/share/mise/shims:/home/${USERNAME}/.local/bin:${PATH}" \
     MISE_ENV=devcontainer
 
