@@ -2,6 +2,7 @@
 rust = ["stable", "nightly"]
 "cargo:bpf-linker" = "latest"
 "cargo:cargo-generate" = "latest"
+protoc = "latest"
 
 [env]
 RUST_LOG = "info"
@@ -13,9 +14,14 @@ run = [
   "rustup target add bpfeb-unknown-none --toolchain nightly",
 ]
 
+[tasks.toolchain]
+description = "install nightly toolchain and rust-src component"
+run = "rustup toolchain install nightly --component rust-src"
+
+
 [tasks.setup]
 description = "Full project setup — install tools and add BPF targets"
-depends = ["add-bpf-targets", "install-latest-bpftool", "mount-trace-debug-fs"]
+depends = ["add-bpf-targets", "install-latest-bpftool", "mount-trace-debug-fs", "toolchain"]
 
 [tasks.new]
 description = "Scaffold a new aya project from the official template"
