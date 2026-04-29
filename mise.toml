@@ -2,7 +2,6 @@
 rust = ["stable", "nightly"]
 "cargo:bpf-linker" = "latest"
 "cargo:cargo-generate" = "latest"
-"aqua:libbpf/bpftool" = "latest"
 
 [env]
 RUST_LOG = "info"
