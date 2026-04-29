@@ -7,9 +7,12 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     process::{Child, Command, Stdio},
+    sync::Arc,
     sync::mpsc::{self, Receiver},
     time::Instant,
 };
+use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
 use tokio::time::{Duration, sleep};
 
 pub mod holdpacket {
@@ -22,8 +25,6 @@ use holdpacket::{
     capturelist_service_client::CapturelistServiceClient,
 };
 
-use std::sync::Arc;
-use tokio::sync::Mutex;
 struct VethFixture {
     iface_ingress: String,
     iface_peer: String,
@@ -31,6 +32,7 @@ struct VethFixture {
 
 struct TapFixture {
     name: String,
+    device: Arc<Mutex<tun::AsyncDevice>>,
 }
 
 impl TapFixture {
@@ -41,11 +43,15 @@ impl TapFixture {
             .args(["tuntap", "del", "dev", &name, "mode", "tap"])
             .output();
         
-        // Create TAP device
-        run_cmd(&["ip", "tuntap", "add", "dev", &name, "mode", "tap"]);
-        run_cmd(&["ip", "link", "set", "dev", &name, "up"]);
-        
-        Self { name }
+        let mut config = tun::Configuration::default();
+        config.tun_name(&name).layer(tun::Layer::L2).up();
+        let device = tun::create_as_async(&config)
+            .unwrap_or_else(|e| panic!("failed to create TAP device {name}: {e}"));
+
+        Self {
+            name,
+            device: Arc::new(Mutex::new(device)),
+        }
     }
     
     fn ifindex(&self) -> u32 {
@@ -64,6 +70,7 @@ impl Drop for TapFixture {
             .output();
     }
 }
+
 fn run_cmd(args: &[&str]) {
     let output = Command::new(args[0])
         .args(&args[1..])
@@ -88,7 +95,7 @@ impl VethFixture {
         // Clean up any stale interface from a previous interrupted run.
         let _ = Command::new("ip")
             .args(["link", "del", iface_ingress.as_str()])
-            .status();
+            .output();
 
         run_cmd(&[
             "ip",
@@ -159,6 +166,28 @@ fn read_mac(iface: &str) -> [u8; 6] {
     let mac = fs::read_to_string(format!("/sys/class/net/{iface}/address"))
         .unwrap_or_else(|e| panic!("failed to read MAC address for {iface}: {e}"));
     parse_mac(mac.trim())
+}
+
+fn parse_ipv4_addrs_from_frame(frame: &[u8]) -> Option<([u8; 4], [u8; 4])> {
+    const IPV4_ETHERTYPE: [u8; 2] = 0x0800u16.to_be_bytes();
+
+    if frame.len() >= 34 && frame[12..14] == IPV4_ETHERTYPE {
+        return Some((frame[26..30].try_into().ok()?, frame[30..34].try_into().ok()?));
+    }
+
+    if frame.len() >= 38 && frame[16..18] == IPV4_ETHERTYPE {
+        return Some((frame[30..34].try_into().ok()?, frame[34..38].try_into().ok()?));
+    }
+
+    if frame.len() >= 20 && (frame[0] >> 4) == 4 {
+        return Some((frame[12..16].try_into().ok()?, frame[16..20].try_into().ok()?));
+    }
+
+    if frame.len() >= 24 && (frame[4] >> 4) == 4 {
+        return Some((frame[16..20].try_into().ok()?, frame[20..24].try_into().ok()?));
+    }
+
+    None
 }
 
 fn ipv4_header_checksum(header: &[u8]) -> u16 {
@@ -446,21 +475,22 @@ async fn test_hold_packet_replay_e2e() {
     test_entry.replay = 1; // Enable replay
     statelistv4.insert(test_ip, test_entry, 0).expect("Failed to update map entry");
 
-    // Open TAP device to receive redirected packets
-    let tap_read = Arc::new(Mutex::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .open(format!("/dev/{}", tap_fixture.name))
-            .expect("Failed to open TAP device"),
-    ));
-
-    let tap_read_clone = Arc::clone(&tap_read);
+    let tap_read = Arc::clone(&tap_fixture.device);
     let read_task = tokio::spawn(async move {
-        let mut buf = [0u8; 2048];
-        let mut file = tap_read_clone.lock().await;
-        match std::io::Read::read(&mut *file, &mut buf) {
-            Ok(n) => Some((buf[..n].to_vec(), n)),
-            Err(_) => None,
+        let mut device = tap_read.lock().await;
+        loop {
+            let mut buf = [0u8; 2048];
+            let n = device
+                .read(&mut buf)
+                .await
+                .expect("Failed to read redirected frame from TAP device");
+            let packet = buf[..n].to_vec();
+
+            if let Some((captured_src_ip, captured_dst_ip)) = parse_ipv4_addrs_from_frame(&packet) {
+                if captured_src_ip == [10, 200, 1, 2] && captured_dst_ip == [10, 200, 1, 1] {
+                    return packet;
+                }
+            }
         }
     });
 
@@ -474,27 +504,26 @@ async fn test_hold_packet_replay_e2e() {
     );
 
     // Wait for packet to be redirected to TAP
-    let result = tokio::time::timeout(Duration::from_secs(2), read_task).await;
-    assert!(result.is_ok(), "Failed to receive packet from TAP device");
-    
-    let packet_data = result.unwrap().unwrap();
-    assert!(packet_data.is_some(), "TAP device did not receive any packets");
-
-    let (captured_packet, captured_len) = packet_data.unwrap();
+    let packet_data = match tokio::time::timeout(Duration::from_secs(2), read_task).await {
+        Ok(join_result) => join_result.expect("TAP reader task panicked"),
+        Err(_) => panic!("Timed out waiting for redirected IPv4 packet on TAP device"),
+    };
+    let captured_len = packet_data.len();
     assert!(
         captured_len >= 34,
         "Captured packet from TAP is too small: {} bytes",
         captured_len
     );
 
-    // Verify captured packet has correct source and destination IPs
-    // IPv4 addresses are at offset 26 (14 byte ethernet + 12 byte IP header offset)
+    let (captured_src_ip, captured_dst_ip) = parse_ipv4_addrs_from_frame(&packet_data)
+        .unwrap_or_else(|| panic!("Captured packet did not contain a recognizable IPv4 frame: {:02x?}", packet_data));
+
     assert_eq!(
-        &captured_packet[26..30], [10, 200, 1, 2],
+        captured_src_ip, [10, 200, 1, 2],
         "Captured packet has incorrect source IP"
     );
     assert_eq!(
-        &captured_packet[30..34], [10, 200, 1, 1],
+        captured_dst_ip, [10, 200, 1, 1],
         "Captured packet has incorrect destination IP"
     );
 
