@@ -16,7 +16,10 @@ run = [
 
 [tasks.toolchain]
 description = "install nightly toolchain and rust-src component"
-run = "rustup toolchain install nightly --component rust-src"
+run = [
+  "rustup toolchain install nightly --component rust-src",
+  "rustup toolchain install stable --component rust-src",
+]
 
 
 [tasks.setup]
