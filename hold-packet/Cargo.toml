@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "hold-operator",
     "hold-packet",
     "hold-packet-common",
     "hold-packet-ebpf",
@@ -12,6 +13,9 @@ license = "MIT OR Apache-2.0"
 edition = "2024"
 
 [workspace.dependencies]
+kube = { version = "3.1.0", default-features = false}
+k8s-openapi = { version = "0.27.0", default-features = false }
+schemars = { version = "1", default-features = true }
 aya = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-build = { git = "https://github.com/aya-rs/aya", default-features = false }
 aya-ebpf = { git = "https://github.com/aya-rs/aya", default-features = false }
