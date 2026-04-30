@@ -5,8 +5,12 @@ license.workspace = true
 edition.workspace = true
 
 [dependencies]
-kube = {workspace = true, features = ["runtime", "derive"] }
+kube = {workspace = true, features = ["runtime", "derive", "client", "rustls-tls"] }
 k8s-openapi = {workspace = true, features = ["latest", "schemars"] }
 schemars = { workspace = true, default-features = true }
+env_logger = { workspace = true }
+futures = "0.3"
+log = { workspace = true }
 serde = "1.0.228"
 serde_json = "1.0.149"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
