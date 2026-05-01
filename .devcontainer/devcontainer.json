@@ -10,7 +10,7 @@
   "postCreateCommand": "mise trust --yes && mise install",
   "customizations": {
     "vscode": {
-      "extensions": ["vscodevim.vim", "rust-lang.rust-analyzer"]
+      "extensions": ["vscodevim.vim", "rust-lang.rust-analyzer","github.copilot-chat"]
     }
   }
 }
