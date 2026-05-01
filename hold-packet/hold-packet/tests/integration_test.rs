@@ -2,7 +2,7 @@ use aya::{
     maps::HashMap,
     programs::{LinkOrder, SchedClassifier, TcAttachType, tc},
 };
-use hold_packet_common::StateEntry;
+use hold_packet_common::{StateEntry, CaptureMode};
 use std::{
     fs,
     io::{BufRead, BufReader},
@@ -478,7 +478,7 @@ async fn test_hold_packet_replay_e2e() {
     
     // === Test Case 1: Packet with capture but no replay (should not redirect) ===
     let mut test_entry = StateEntry::default();
-    test_entry.replay = 0; // No replay
+    test_entry.mode = CaptureMode::PassThrough; // No replay
     statelistv4.insert(test_ip, test_entry, 0).expect("Failed to insert map entry");
 
     let src_mac = read_mac(&veth_fixture.iface_peer);
@@ -501,7 +501,7 @@ async fn test_hold_packet_replay_e2e() {
     // === Test Case 2: Packet with replay enabled (should redirect to TAP) ===
     let initial_ts = entry.last_seen_ns;
     let mut test_entry = StateEntry::default();
-    test_entry.replay = 1; // Enable replay
+    test_entry.mode = CaptureMode::Hold; // Enable replay
     statelistv4.insert(test_ip, test_entry, 0).expect("Failed to update map entry");
 
     let tap_read = Arc::clone(&tap_fixture.device);
@@ -558,7 +558,7 @@ async fn test_hold_packet_replay_e2e() {
 
     // === Test Case 3: Verify replay flag persists and works consistently ===
     let entry = statelistv4.get(&test_ip, 0).expect("Entry missing from map");
-    assert_eq!(entry.replay, 1, "Replay flag should remain enabled");
+    assert_eq!(entry.mode, CaptureMode::Hold, "Capture mode should remain Hold");
     assert!(
         entry.last_seen_ns > initial_ts,
         "last_seen_ns should be updated for redirected packet"
@@ -613,7 +613,7 @@ async fn test_hold_packet_redirects_packets_marked_cafe_in_option_a() {
 
     let test_ip: u32 = u32::from_be_bytes([10, 200, 1, 1]);
     let mut test_entry = StateEntry::default();
-    test_entry.replay = 1;
+    test_entry.mode = CaptureMode::Hold;
     statelistv4
         .insert(test_ip, test_entry, 0)
         .expect("Failed to insert replay-enabled map entry");

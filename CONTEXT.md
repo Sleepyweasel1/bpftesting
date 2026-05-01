@@ -19,14 +19,16 @@ packets whose destination matches a Captured IP are subject to the hold
 decision.
 
 **Capture Mode**
-The current disposition assigned to a Captured IP, stored as `StateEntry.replay`:
-- `pass-through` (`replay=0`): service is live; packets flow normally.
-- `hold` (`replay=1`): service is scaled-to-zero; packets are redirected to the
+The current disposition assigned to a Captured IP, stored as `StateEntry.mode` using the `CaptureMode`
+enum defined in `hold-packet-common`. Variants:
+- `CaptureMode::PassThrough` (discriminant 0): service is live; packets flow normally.
+- `CaptureMode::Hold` (discriminant 1): service is scaled-to-zero; packets are redirected to the
+  TAP device.
   TAP device.
 
 **StateEntry**
-The shared kernel↔userspace record for a single Captured IP. Carries
-`last_seen_ns`, `packet_count`, and the current Capture Mode.
+The shared kernel↔userspace record for a single Captured IP, defined in `hold-packet-common`.
+Carries `last_seen_ns`, `packet_count`, and the current `Capture Mode` (as a `CaptureMode` enum).
 
 **Idle Timeout**
 The configurable period of inactivity (default 300 s) after which a Captured IP

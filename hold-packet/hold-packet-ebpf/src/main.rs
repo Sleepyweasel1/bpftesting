@@ -36,16 +36,16 @@ fn redirect_to_tap() -> i32 {
 
 fn replay_v6 (address: u128) -> bool {
     unsafe { 
-        if let Some(replay) = STATEV6.get(&address) {
-            return replay.replay != 0;
+        if let Some(entry) = STATEV6.get(&address) {
+            return entry.mode.is_hold();
         }
     }
     false
 }
 fn replay_v4 (address: u32) -> bool {
     unsafe { 
-        if let Some(replay) = STATEV4.get(&address) {
-            return replay.replay != 0;
+        if let Some(entry) = STATEV4.get(&address) {
+            return entry.mode.is_hold();
         }
     }
     false

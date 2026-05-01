@@ -9,6 +9,7 @@ license.workspace = true
 hold-packet-common = { path = "../hold-packet-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+aya-obj = { workspace = true }
 aya-log = { workspace = true }
 env_logger = { workspace = true }
 libc = { workspace = true }
