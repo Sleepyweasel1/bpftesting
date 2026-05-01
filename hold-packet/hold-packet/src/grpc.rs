@@ -1,16 +1,14 @@
- use std::{net::{IpAddr, Ipv4Addr}, str::FromStr, sync::{Arc}};
+ use std::net::IpAddr;
 
-use aya::maps::{HashMap as BpfHashMap, MapData};
 use tonic::{Request, Response, Status};
 use hold_packet_common::StateEntry;
 use crate::{holdpacket::{
     AddRuleRequest, ListRulesRequest, ListRulesResponse, RemoveRuleRequest, ReplayRuleRequest, RuleResponse, capturelist_service_server::CapturelistService
-}, replay};
-use tokio::sync::RwLock;
+}, replay, capture_store::CaptureStore};
+use std::sync::Arc;
 
 pub struct CapturelistServer {
-    pub state_v4: Arc<RwLock<BpfHashMap<MapData, u32, StateEntry>>>,
-    pub state_v6: Arc<RwLock<BpfHashMap<MapData, u128, StateEntry>>>,
+    pub capture_store: Arc<CaptureStore>,
     pub replayer: Arc<replay::Replayer>,
 }
 
@@ -23,20 +21,10 @@ impl CapturelistService for CapturelistServer {
         let ip_str = request.into_inner().ip;
         let ip: IpAddr = ip_str.parse()
             .map_err(|e| Status::invalid_argument(format!("invalid IP: {e}")))?;
-        match ip {
-            IpAddr::V4(v4) => {
-                let addr: u32 = v4.into();
-                let mut state_v4 = self.state_v4.write().await;
-                state_v4.insert(addr, StateEntry::default(), 0)
-                    .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
-            }
-            IpAddr::V6(v6) => {
-                let addr: u128 = v6.into();
-                let mut state_v6 = self.state_v6.write().await;
-                state_v6.insert(addr, StateEntry::default(), 0)
-                    .map_err(|e| Status::internal(format!("map insert failed: {e}")))?;
-            }
-        }        
+        
+        self.capture_store.insert(ip, StateEntry::default()).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
         Ok(Response::new(RuleResponse {
             success: true,
             error: String::new(),
@@ -50,21 +38,10 @@ impl CapturelistService for CapturelistServer {
         let ip_str = request.into_inner().ip;
         let ip: IpAddr = ip_str.parse()
             .map_err(|e| Status::invalid_argument(format!("invalid IP: {e}")))?;
-        match ip {
-            IpAddr::V4(v4) => {
-                let addr: u32 = v4.into();
-                let mut state_v4 = self.state_v4.write().await;
-                state_v4.remove(&addr)
-                    .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
-            }
-            IpAddr::V6(v6) => {
-                let addr: u128 = v6.into();
-                let mut state_v6 = self.state_v6.write().await;
-                state_v6.remove(&addr)
-                    .map_err(|e| Status::internal(format!("map remove failed: {e}")))?;
-            }
-        }
-
+        
+        self.capture_store.remove(ip).await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
         Ok(Response::new(RuleResponse {
             success: true,
             error: String::new(),
@@ -75,23 +52,11 @@ impl CapturelistService for CapturelistServer {
         &self,
         _request: Request<ListRulesRequest>,
     ) -> Result<Response<ListRulesResponse>, Status> {
-        let v4_map = self.state_v4.read().await;
-        let mut ips: Vec<String> = v4_map
-            .keys()
-            .filter_map(|r| r.ok())
-            .map(|addr| Ipv4Addr::from(addr).to_string())
+        let all_entries = self.capture_store.iter().await;
+        let ips: Vec<String> = all_entries
+            .into_iter()
+            .map(|(ip, _entry)| ip.to_string())
             .collect();
-        let v6_map = self.state_v6.read().await;
-        let ips_v6: Vec<String> = v6_map
-            .keys()
-            .filter_map(|r| r.ok())
-            .map(|addr| {
-                let bytes = addr.to_be_bytes();
-                let ipv6 = std::net::Ipv6Addr::from(bytes);
-                ipv6.to_string()
-            })
-            .collect();
-        ips.extend(ips_v6);
         Ok(Response::new(ListRulesResponse { ips }))
     }
     async fn replay_rule (&self, request: Request<ReplayRuleRequest>) -> Result<Response<RuleResponse>, Status> {

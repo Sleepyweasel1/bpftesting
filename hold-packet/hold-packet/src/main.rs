@@ -24,6 +24,9 @@ use grpc::CapturelistServer;
 use holdpacket::capturelist_service_server::CapturelistServiceServer;
 mod replay;
 mod grpc;
+mod capture_store;
+
+use capture_store::CaptureStore;
 
 pub mod holdpacket {
     tonic::include_proto!("holdpacket");
@@ -114,9 +117,13 @@ async fn main() -> anyhow::Result<()> {
         .expect("TAP_IFINDEX map not found");
     let mut tap_ifindex: Array<_, u32> = Array::try_from(tap_ifindex_map)?;
 
-    spawn_idle_monitor(
+    let capture_store = Arc::new(CaptureStore::new(
         Arc::clone(&shared_statelistv4),
         Arc::clone(&shared_statelistv6),
+    ));
+
+    spawn_idle_monitor(
+        Arc::clone(&capture_store),
         idle_timeout_secs,
     );
     //start the replay task that will replay captured packets for IPs in the replay list
@@ -134,8 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // Start the gRPC control-plane server.
     let grpc_addr = grpc_addr.parse()?;
     let svc = CapturelistServiceServer::new(CapturelistServer {
-            state_v4: Arc::clone(&shared_statelistv4),
-            state_v6: Arc::clone(&shared_statelistv6),
+            capture_store: Arc::clone(&capture_store),
             replayer: Arc::clone(&replayer),
     });
     tokio::task::spawn(async move {
@@ -262,8 +268,7 @@ pub fn calculate_state_updates<K: Copy>(
 }
 
 fn spawn_idle_monitor(
-    statelist_v4: Arc<RwLock<HashMap<MapData, u32, StateEntry>>>,
-    statelist_v6: Arc<RwLock<HashMap<MapData, u128, StateEntry>>>,
+    capture_store: Arc<CaptureStore>,
     idle_timeout_secs: u64,
 ) {
     let idle_timeout_ns = idle_timeout_secs.saturating_mul(1_000_000_000);
@@ -273,30 +278,19 @@ fn spawn_idle_monitor(
             ticker.tick().await;
             let now_ns = current_monotonic_ns();
             
-            let updates: Vec<(u32, StateEntry)> = {
-                let v4_map = statelist_v4.read().await;
-                calculate_state_updates(v4_map.iter().filter_map(|r| r.ok()), now_ns, idle_timeout_ns)
-            }; // read lock dropped here
+            // Get the current snapshot of all captured IPs
+            let all_entries = capture_store.iter().await;
+            
+            // Calculate which entries need mode changes
+            let updates: Vec<(std::net::IpAddr, StateEntry)> = calculate_state_updates(
+                all_entries.into_iter(),
+                now_ns,
+                idle_timeout_ns,
+            );
 
-            // Write phase — lock held only for brief syscall bursts
-            if !updates.is_empty() {
-                let mut v4_map = statelist_v4.write().await;
-                for (ip, entry) in updates {
-                    v4_map.insert(ip, entry, 0).ok();
-                }
-            }
-        
-            let updates_v6: Vec<(u128, StateEntry)> = {
-                let v6_map = statelist_v6.read().await;
-                calculate_state_updates(v6_map.iter().filter_map(|r| r.ok()), now_ns, idle_timeout_ns)
-            }; // read lock dropped here
-
-            // Write phase — lock held only for brief syscall bursts
-            if !updates_v6.is_empty() {
-                let mut v6_map = statelist_v6.write().await;
-                for (ip, entry) in updates_v6 {
-                    v6_map.insert(ip, entry, 0).ok();
-                }
+            // Apply updates by setting mode only (idempotent for missing IPs)
+            for (ip, entry) in updates {
+                let _ = capture_store.update_mode(ip, entry.mode).await;
             }
         }
     });

@@ -85,3 +85,9 @@ The Reconciler is the intended sole client; exposes `AddRule`, `RemoveRule`,
 **CapturelistServer**
 The tonic service struct that implements `CapturelistService`, bridging the
 gRPC surface to the eBPF state maps and the Staging Area.
+
+**Capture Store**
+The userspace seam that encapsulates dual eBPF state maps (`STATEV4` / `STATEV6`)
+behind one map-agnostic interface keyed by `IpAddr`. It is the boundary that
+keeps address-family branching and map-type details out of gRPC handlers and
+background workers.
