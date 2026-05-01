@@ -15,6 +15,7 @@ Single-context repo:
 
 ```
 /
+├── SPEC.md
 ├── CONTEXT.md
 ├── docs/adr/
 │   ├── 0001-some-decision.md

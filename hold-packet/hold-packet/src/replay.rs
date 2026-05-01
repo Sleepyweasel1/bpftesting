@@ -138,8 +138,8 @@ impl Replayer {
 
     /// Writes the frame back to the TAP fd so the kernel processes it as a
     /// received frame on the TAP interface (RX path → routing → DNAT → pod).
-    /// The eBPF TC filter lives on eth0 ingress, not the TAP, so there is no
-    /// recapture loop.
+    /// Under Option A, loop prevention is structural: the eBPF TC filter lives
+    /// on eth0 ingress, while replay is injected via TAP RX.
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
         self.tap_writer.lock().await.write_all(data).await
     }

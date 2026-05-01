@@ -201,7 +201,14 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn send_test_ipv4_frame(iface: &str, src_mac: [u8; 6], dst_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4]) {
+fn send_test_ipv4_frame_with_mark(
+    iface: &str,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    mark: Option<u32>,
+) {
     let mut frame = [0u8; 34];
 
     // Ethernet header
@@ -229,6 +236,24 @@ fn send_test_ipv4_frame(iface: &str, src_mac: [u8; 6], dst_mac: [u8; 6], src_ip:
     };
     assert!(fd >= 0, "socket(AF_PACKET) failed: {}", std::io::Error::last_os_error());
 
+    if let Some(mark) = mark {
+        let set_mark_ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &mark as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            set_mark_ret,
+            0,
+            "setsockopt(SO_MARK) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
     addr.sll_protocol = (libc::ETH_P_IP as u16).to_be();
@@ -254,6 +279,10 @@ fn send_test_ipv4_frame(iface: &str, src_mac: [u8; 6], dst_mac: [u8; 6], src_ip:
         "sendto() failed: {}",
         std::io::Error::last_os_error()
     );
+}
+
+fn send_test_ipv4_frame(iface: &str, src_mac: [u8; 6], dst_mac: [u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4]) {
+    send_test_ipv4_frame_with_mark(iface, src_mac, dst_mac, src_ip, dst_ip, None);
 }
 
 struct ChildGuard {
@@ -534,6 +563,107 @@ async fn test_hold_packet_replay_e2e() {
         entry.last_seen_ns > initial_ts,
         "last_seen_ns should be updated for redirected packet"
     );
+}
+
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore = "eBPF integration tests require Linux")]
+async fn test_hold_packet_redirects_packets_marked_cafe_in_option_a() {
+    // Root is required for tc, link management, TAP device creation, and loading eBPF programs.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("Skipping test_hold_packet_redirects_packets_marked_cafe_in_option_a: requires root");
+        return;
+    }
+
+    let veth_fixture = VethFixture::new();
+    let tap_fixture = TapFixture::new();
+    let tap_ifindex = tap_fixture.ifindex();
+
+    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/hold-packet"
+    )))
+    .expect("Failed to load eBPF object file");
+
+    let tap_ifindex_arr = ebpf
+        .take_map("TAP_IFINDEX")
+        .expect("TAP_IFINDEX map not found");
+    let mut tap_ifindex_map: aya::maps::Array<_, u32> =
+        aya::maps::Array::try_from(tap_ifindex_arr).unwrap();
+    tap_ifindex_map
+        .set(0, tap_ifindex, 0)
+        .expect("Failed to set TAP ifindex");
+
+    let program: &mut SchedClassifier = ebpf
+        .program_mut("hold_packet")
+        .expect("Program not found")
+        .try_into()
+        .expect("Program is not a SchedClassifier");
+
+    program.load().expect("Failed to load program into kernel");
+    program
+        .attach_with_options(
+            &veth_fixture.iface_ingress,
+            TcAttachType::Ingress,
+            tc::TcAttachOptions::TcxOrder(LinkOrder::first()),
+        )
+        .expect("Failed to attach tc ingress classifier");
+
+    let statelistv4_map = ebpf.take_map("STATEV4").expect("STATEV4 map not found");
+    let mut statelistv4: HashMap<_, u32, StateEntry> = HashMap::try_from(statelistv4_map).unwrap();
+
+    let test_ip: u32 = u32::from_be_bytes([10, 200, 1, 1]);
+    let mut test_entry = StateEntry::default();
+    test_entry.replay = 1;
+    statelistv4
+        .insert(test_ip, test_entry, 0)
+        .expect("Failed to insert replay-enabled map entry");
+
+    let src_mac = read_mac(&veth_fixture.iface_peer);
+    let dst_mac = read_mac(&veth_fixture.iface_ingress);
+
+    let tap_read = Arc::clone(&tap_fixture.device);
+    let read_task = tokio::spawn(async move {
+        let mut device = tap_read.lock().await;
+        loop {
+            let mut buf = [0u8; 2048];
+            let n = device
+                .read(&mut buf)
+                .await
+                .expect("Failed to read redirected frame from TAP device");
+            let packet = buf[..n].to_vec();
+
+            if let Some((captured_src_ip, captured_dst_ip)) = parse_ipv4_addrs_from_frame(&packet) {
+                if captured_src_ip == [10, 200, 1, 2] && captured_dst_ip == [10, 200, 1, 1] {
+                    return packet;
+                }
+            }
+        }
+    });
+
+    // Option A invariant: packet mark is ignored by classifier behavior.
+    send_test_ipv4_frame_with_mark(
+        &veth_fixture.iface_peer,
+        src_mac,
+        dst_mac,
+        [10, 200, 1, 2],
+        [10, 200, 1, 1],
+        Some(0xCAFE),
+    );
+
+    let packet_data = match tokio::time::timeout(Duration::from_secs(2), read_task).await {
+        Ok(join_result) => join_result.expect("TAP reader task panicked"),
+        Err(_) => panic!("Timed out waiting for redirected IPv4 packet on TAP device"),
+    };
+
+    assert!(
+        packet_data.len() >= 34,
+        "Captured packet from TAP is too small: {} bytes",
+        packet_data.len()
+    );
+    let (captured_src_ip, captured_dst_ip) = parse_ipv4_addrs_from_frame(&packet_data)
+        .unwrap_or_else(|| panic!("Captured packet did not contain a recognizable IPv4 frame: {:02x?}", packet_data));
+    assert_eq!(captured_src_ip, [10, 200, 1, 2], "Captured packet has incorrect source IP");
+    assert_eq!(captured_dst_ip, [10, 200, 1, 1], "Captured packet has incorrect destination IP");
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ rust = ["stable", "nightly"]
 "cargo:bpf-linker" = "latest"
 "cargo:cargo-generate" = "latest"
 protoc = "latest"
+rg = "latest"
 
 [env]
 RUST_LOG = "info"

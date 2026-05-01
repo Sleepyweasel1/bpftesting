@@ -23,9 +23,6 @@ pub fn hold_packet(ctx: TcContext) -> i32 {
         Err(_) => TCX_NEXT,
     }
 }
-fn is_replayed(ctx: &TcContext) -> bool {
-    unsafe { (*ctx.skb.skb).mark  == 0xCAFE }
-}
 
 fn redirect_to_tap() -> i32 {
     if let Some(ifindex) = TAP_IFINDEX.get(0) {
@@ -61,9 +58,6 @@ fn capture_ipv4(address: u32) -> bool {
     unsafe { STATEV4.get(&address).is_some() }
 }
 fn try_hold_packet(ctx: TcContext) -> Result<i32, ()> {
-    if is_replayed(&ctx) {
-        return Ok(TCX_NEXT); // let replayed packets pass through
-    }
     // info!(&ctx, "received a packet");
     let timestamp = unsafe{bpf_ktime_get_ns()};
     // Ok(TC_ACT_PIPE)
