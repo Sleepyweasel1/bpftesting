@@ -1,4 +1,4 @@
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Serialize, Deserialize};
@@ -19,9 +19,27 @@ pub struct TargetRef {
     pub namespace: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum ReconcileIntent {
+    HoldCapture,
+    RemoveCapture,
+    Replay,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+pub enum ReconcileOutcome {
+    NoOp,
+    Succeeded,
+    RecoverableFailure,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ScaleToZeroStatus {
-    pub replicas: i32,
-    checksum: String,
-    last_updated: Option<Time>,
+    pub observed_generation: i64,
+    pub intent: ReconcileIntent,
+    pub outcome: ReconcileOutcome,
+    pub conditions: Vec<Condition>,
+    pub last_reconciled_at: Option<Time>,
+    pub message: Option<String>,
 }

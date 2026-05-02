@@ -73,6 +73,47 @@ policy equivalence. See ADR-0007 (and ADR-0001 partial supersession note).
 The Kubernetes custom resource (`scale.sleepy.com/v0/ScaleToZero`) that the
 hold-operator watches. Carries a `target_ref` (deployment name + namespace).
 
+**ScaleToZero Status**
+The externally visible reconciliation state for a ScaleToZero CRD instance.
+Modeled as Kubernetes Conditions plus intent/outcome fields, so maintainers can
+distinguish stable no-op runs, successful applied intent, and recoverable
+failures.
+
+Legacy status fields (`replicas`, `checksum`, `last_updated`) are replaced by
+this model in the current slice rather than maintained in parallel.
+
+The canonical condition type is `Reconciled`.
+- `status=True` for outcomes `NoOp` and `Succeeded`
+- `status=False` for outcome `RecoverableFailure`
+- `reason` must mirror the outcome value exactly
+- `message` is human-oriented operator detail and not a parsing contract
+
+Status is patched only when semantic fields change: `observed_generation`,
+`intent`, `outcome`, or `Reconciled` condition status/reason/message. Timestamp
+alone must not trigger writes; timestamp updates only when a semantic write
+occurs.
+
+**Reconcile Intent**
+The operator's computed desired action for the current ScaleToZero target at a
+point in time (for example, hold traffic capture, remove capture, or replay).
+Intent is recorded in ScaleToZero Status to make reconciliation decisions
+observable. Canonical values: `HoldCapture`, `RemoveCapture`, `Replay`.
+
+**Reconcile Outcome**
+The result of attempting the current Reconcile Intent during a reconcile run.
+Outcome must distinguish at least: no-op, success, and recoverable failure.
+Canonical values: `NoOp`, `Succeeded`, `RecoverableFailure`.
+
+`NoOp` means the desired capture state already matched the applied state and no
+external mutation was required. `Succeeded` means at least one external
+mutation was required and completed in this run. `RecoverableFailure` means a
+required mutation failed with a retryable error.
+
+For this slice, `RecoverableFailure` includes transient Kubernetes API
+read/write errors (including status patch failures), eventual-consistency
+lookup misses, and transport/service-unavailable external control-plane errors.
+No terminal/fatal outcome value is introduced in this slice.
+
 **Reconciler**
 The controller loop in hold-operator that receives ScaleToZero events and
 should drive the hold-packet gRPC control plane in response.
