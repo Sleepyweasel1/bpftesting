@@ -4,6 +4,8 @@ rust = ["stable", "nightly"]
 "cargo:cargo-generate" = "latest"
 protoc = "latest"
 rg = "latest"
+vcluster = "latest"
+kubectl = "latest"
 
 [env]
 RUST_LOG = "info"

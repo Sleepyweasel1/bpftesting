@@ -11,3 +11,7 @@ Triage roles use the default vocabulary: `needs-triage`, `needs-info`, `ready-fo
 ### Domain docs
 
 Domain docs use a single-context layout at repo root. See `docs/agents/domain.md`.
+
+### Repo tooling
+
+Primarily uses mise for tool installation and tasks
