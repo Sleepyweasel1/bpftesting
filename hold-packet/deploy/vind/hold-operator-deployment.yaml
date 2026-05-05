@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hold-operator
+  namespace: hold-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hold-operator
+  template:
+    metadata:
+      labels:
+        app: hold-operator
+    spec:
+      serviceAccountName: hold-operator
+      containers:
+        - name: hold-operator
+          image: hold-operator:vind-local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info

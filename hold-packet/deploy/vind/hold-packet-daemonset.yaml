@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hold-packet
+  namespace: hold-system
+spec:
+  selector:
+    matchLabels:
+      app: hold-packet
+  template:
+    metadata:
+      labels:
+        app: hold-packet
+    spec:
+      hostNetwork: true
+      containers:
+        - name: hold-packet
+          image: hold-packet:vind-local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--iface"
+            - "$(HOLD_PACKET_IFACE)"
+          env:
+            - name: HOLD_PACKET_IFACE
+              value: eth0
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            runAsUser: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON", "NET_ADMIN"]
