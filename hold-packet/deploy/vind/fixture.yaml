@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fixture-echo
+  namespace: hold-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fixture-echo
+  template:
+    metadata:
+      labels:
+        app: fixture-echo
+    spec:
+      containers:
+        - name: fixture-echo
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fixture-echo
+  namespace: hold-system
+spec:
+  selector:
+    app: fixture-echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+---
+apiVersion: scale.sleepy.com/v0
+kind: ScaleToZero
+metadata:
+  name: fixture-echo
+  namespace: hold-system
+spec:
+  target_ref:
+    deployment_name: fixture-echo
+    namespace: hold-system
