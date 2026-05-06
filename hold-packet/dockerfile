@@ -23,6 +23,7 @@ RUN case "$TARGETARCH" in \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     pkg-config \
+    protobuf-compiler \
     clang \
     lld \
     gcc-aarch64-linux-gnu && \

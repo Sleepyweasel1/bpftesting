@@ -16,6 +16,7 @@ use kube::{
 	},
 };
 use log::{error, info};
+use rustls::crypto::ring::default_provider;
 use serde_json::json;
 use tokio::time::sleep;
 use tonic::{Code, transport::Endpoint};
@@ -50,6 +51,9 @@ struct OperatorContext {
 #[tokio::main]
 async fn main() -> Result<(), kube::Error> {
 	env_logger::init();
+	default_provider()
+		.install_default()
+		.expect("failed to install rustls crypto provider");
 
 	info!("starting hold-operator controller");
 

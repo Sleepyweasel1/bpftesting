@@ -6,14 +6,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_DIR="$REPO_ROOT/hold-packet/deploy/vind"
 OPERATOR_DIR="$REPO_ROOT/hold-packet"
 IFACE="${HOLD_PACKET_IFACE:-eth0}"
+VCLUSTER_NODE_CONTAINER="vcluster.cp.hold-packet-dev"
+SKIP_DAEMONSET_READINESS="${SKIP_DAEMONSET_READINESS:-0}"
+
+load_image_into_vind() {
+  local image="$1"
+
+  docker save "$image" | docker exec -i "$VCLUSTER_NODE_CONTAINER" ctr -n k8s.io images import -
+}
 
 echo "==> Building images..."
 docker build -t hold-packet:vind-local "$OPERATOR_DIR"
 docker build -t hold-operator:vind-local \
   -f - "$OPERATOR_DIR" <<'DOCKERFILE'
-FROM rust:1.87-slim-bookworm AS builder
+FROM rust:1.94-slim-bookworm AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config protobuf-compiler clang lld && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN cargo build --release -p hold-operator
 FROM gcr.io/distroless/cc-debian12
@@ -22,8 +30,8 @@ ENTRYPOINT ["/hold-operator"]
 DOCKERFILE
 
 echo "==> Loading images into vind cluster..."
-vcluster node load-image --image hold-packet:vind-local
-vcluster node load-image --image hold-operator:vind-local
+load_image_into_vind hold-packet:vind-local
+load_image_into_vind hold-operator:vind-local
 
 echo "==> Generating CRD from source..."
 (cd "$OPERATOR_DIR" && cargo run --quiet --release -p hold-operator --bin crd-gen) \
@@ -67,21 +75,25 @@ kubectl -n hold-system wait deployment/hold-operator \
   --for=condition=Available --timeout=120s || smoke_fail
 
 echo "  Waiting for hold-packet DaemonSet to be ready..."
-TIMEOUT=120
-ELAPSED=0
-while true; do
-  DESIRED=$(kubectl -n hold-system get daemonset hold-packet -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
-  READY=$(kubectl -n hold-system get daemonset hold-packet -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
-  if [[ "$DESIRED" -gt 0 && "$DESIRED" == "$READY" ]]; then
-    break
-  fi
-  if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
-    echo "  DaemonSet not ready: desired=$DESIRED ready=$READY"
-    smoke_fail
-  fi
-  sleep 5
-  ELAPSED=$((ELAPSED + 5))
-done
+if [[ "$SKIP_DAEMONSET_READINESS" == "1" ]]; then
+  echo "  Skipping DaemonSet readiness check (SKIP_DAEMONSET_READINESS=1)"
+else
+  TIMEOUT=120
+  ELAPSED=0
+  while true; do
+    DESIRED=$(kubectl -n hold-system get daemonset hold-packet -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo "0")
+    READY=$(kubectl -n hold-system get daemonset hold-packet -o jsonpath='{.status.numberReady}' 2>/dev/null || echo "0")
+    if [[ "$DESIRED" -gt 0 && "$DESIRED" == "$READY" ]]; then
+      break
+    fi
+    if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
+      echo "  DaemonSet not ready: desired=$DESIRED ready=$READY"
+      smoke_fail
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+  done
+fi
 
 echo ""
 echo "==> ScaleToZero control plane is ready in vind."
