@@ -45,7 +45,14 @@ timestamp.
 
 **Staging Area**
 The in-process `HashMap<u64, StagedPacket>` that accumulates Staged Packets
-awaiting an operator replay or TTL eviction.
+awaiting an operator replay or TTL eviction. The Staging Area emits a
+`StagedEvent` whenever a packet is staged so observers can react without
+reading internal map state.
+
+**Staged Event**
+The event emitted when a packet enters the Staging Area. Carries the staged
+packet ID plus parsed source/destination IPs (`id`, `src_ip`, `dst_ip`) over
+an internal broadcast channel.
 
 **Staged TTL**
 The maximum age of a Staged Packet before it is pruned (120 s). Chosen to

@@ -1,11 +1,10 @@
-use core::alloc;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant};
 use tun::Configuration;
 
@@ -23,12 +22,20 @@ pub struct StagedPacket {
     pub staged_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedEvent {
+    pub id: u64,
+    pub src_ip: IpAddr,
+    pub dst_ip: IpAddr,
+}
+
 pub struct Replayer {
     tap_reader: Arc<Mutex<ReadHalf<tun::AsyncDevice>>>,
     tap_writer: Arc<Mutex<WriteHalf<tun::AsyncDevice>>>,
     tap_ifindex: u32,
     pub next_id: Arc<AtomicU64>,
     pub staged: Arc<Mutex<HashMap<u64, StagedPacket>>>,
+    staged_events_tx: broadcast::Sender<StagedEvent>,
 }
 
 impl Replayer {
@@ -43,6 +50,7 @@ impl Replayer {
         };
 
         let (reader, writer) = tokio::io::split(tap);
+        let (staged_events_tx, _) = broadcast::channel(1024);
 
         Ok(Self {
             tap_reader: Arc::new(Mutex::new(reader)),
@@ -50,11 +58,16 @@ impl Replayer {
             tap_ifindex,
             next_id: Arc::new(AtomicU64::new(1)),
             staged: Arc::new(Mutex::new(HashMap::new())),
+            staged_events_tx,
         })
     }
 
     pub fn tap_ifindex(&self) -> u32 {
         self.tap_ifindex
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<StagedEvent> {
+        self.staged_events_tx.subscribe()
     }
 
     /// Reads one L2 frame from the TAP device, parses the source/destination
@@ -64,21 +77,13 @@ impl Replayer {
         let mut buf = [0u8; 65536];
         let n = self.tap_reader.lock().await.read(&mut buf).await?;
 
-        let (src_ip, dst_ip) = parse_ip_addrs(&buf[..n]);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        self.staged.lock().await.insert(
-            id,
-            StagedPacket {
-                data: buf[..n].to_vec(),
-                src_ip,
-                dst_ip,
-                len: n,
-                staged_at: Instant::now(),
-            },
-        );
-
-        Ok(id)
+        Ok(stage_packet(
+            &self.staged,
+            &self.next_id,
+            &self.staged_events_tx,
+            &buf[..n],
+        )
+        .await)
     }
     pub fn spawn_runner(self: Arc<Self>) {
         tokio::task::spawn(async move {
@@ -177,5 +182,70 @@ fn parse_ip_addrs(frame: &[u8]) -> (IpAddr, IpAddr) {
             (IpAddr::V6(Ipv6Addr::from(src)), IpAddr::V6(Ipv6Addr::from(dst)))
         }
         _ => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    }
+}
+
+async fn stage_packet(
+    staged: &Mutex<HashMap<u64, StagedPacket>>,
+    next_id: &AtomicU64,
+    staged_events_tx: &broadcast::Sender<StagedEvent>,
+    frame: &[u8],
+) -> u64 {
+    let (src_ip, dst_ip) = parse_ip_addrs(frame);
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+
+    staged.lock().await.insert(
+        id,
+        StagedPacket {
+            data: frame.to_vec(),
+            src_ip,
+            dst_ip,
+            len: frame.len(),
+            staged_at: Instant::now(),
+        },
+    );
+
+    let _ = staged_events_tx.send(StagedEvent { id, src_ip, dst_ip });
+    id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StagedEvent, StagedPacket, stage_packet};
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::AtomicU64;
+    use tokio::sync::{Mutex, broadcast};
+
+    #[tokio::test]
+    async fn subscribe_receives_staged_event_with_ips_and_id() {
+        let staged = Mutex::new(HashMap::<u64, StagedPacket>::new());
+        let next_id = AtomicU64::new(1);
+        let (events_tx, _) = broadcast::channel(8);
+        let mut rx = events_tx.subscribe();
+
+        let frame = [
+            // Ethernet header
+            0, 1, 2, 3, 4, 5, // dst mac
+            6, 7, 8, 9, 10, 11, // src mac
+            0x08, 0x00, // ethertype IPv4
+            // IPv4 header
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0,
+            192, 0, 2, 1, // src ip
+            198, 51, 100, 7, // dst ip
+        ];
+
+        let id = stage_packet(&staged, &next_id, &events_tx, &frame).await;
+        let event = rx.recv().await.expect("expected staged event");
+
+        assert_eq!(id, 1);
+        assert_eq!(
+            event,
+            StagedEvent {
+                id: 1,
+                src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            }
+        );
     }
 }
