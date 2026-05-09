@@ -19,5 +19,7 @@ spec:
           image: hold-operator:vind-local
           imagePullPolicy: IfNotPresent
           env:
+            - name: HOLD_PACKET_GRPC_ADDR
+              value: http://hold-packet.hold-system.svc.cluster.local:50051
             - name: RUST_LOG
               value: info

@@ -4,7 +4,7 @@ set -euo pipefail
 
 CLUSTER="hold-packet-dev"
 
-if vcluster list | grep -q "^${CLUSTER}[[:space:]]"; then
+if vcluster list --driver docker --output json | jq -r '.[].Name' | grep -q "^${CLUSTER}$"; then
   echo "Deleting vcluster '$CLUSTER'..."
   vcluster delete "$CLUSTER" --driver docker
   echo "Cluster '$CLUSTER' deleted."

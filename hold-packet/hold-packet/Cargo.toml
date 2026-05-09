@@ -27,6 +27,7 @@ clap = { workspace = true, features = ["derive"] }
 tonic = "0.14.5"
 prost = "0.14.3"
 tonic-prost = "0.14.5"
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tun = { version = "0.8.7", features = ["async"] }
 [build-dependencies]
 anyhow = { workspace = true }

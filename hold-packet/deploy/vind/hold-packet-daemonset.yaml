@@ -32,3 +32,24 @@ spec:
             capabilities:
               drop: ["ALL"]
               add: ["BPF", "PERFMON", "NET_ADMIN"]
+          volumeMounts:
+            - name: dev-net
+              mountPath: /dev/net
+      volumes:
+        - name: dev-net
+          hostPath:
+            path: /dev/net
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hold-packet
+  namespace: hold-system
+spec:
+  selector:
+    app: hold-packet
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051

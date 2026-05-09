@@ -3,12 +3,16 @@ use std::{
 	sync::Mutex,
 	time::Duration,
 };
+#[cfg(test)]
+use std::collections::VecDeque;
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream::{BoxStream, iter, pending}};
 use tonic::transport::Endpoint;
 
 use crate::holdpacket::{
 	AddRuleRequest, ListRulesRequest, RemoveRuleRequest, ReplayRuleRequest,
+	WatchStagedPacketsRequest,
 	capturelist_service_client::CapturelistServiceClient,
 };
 
@@ -18,10 +22,18 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 // Error type
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CaptureControlError {
 	Transient(String),
 	Permanent(String),
+	NotFound(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedEvent {
+	pub id: u64,
+	pub src_ip: IpAddr,
+	pub dst_ip: IpAddr,
 }
 
 // ---------------------------------------------------------------------------
@@ -34,6 +46,7 @@ pub trait CaptureControl: Send + Sync {
 	async fn remove_rule(&self, ip: IpAddr) -> Result<(), CaptureControlError>;
 	async fn list_rules(&self) -> Result<Vec<IpAddr>, CaptureControlError>;
 	async fn replay_rule(&self, id: u64) -> Result<(), CaptureControlError>;
+	async fn watch_staged(&self) -> Result<BoxStream<'static, StagedEvent>, CaptureControlError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,10 +129,39 @@ impl CaptureControl for HoldPacketClient {
 			.map_err(classify_status)?;
 		check_response(response.into_inner())
 	}
+
+	async fn watch_staged(&self) -> Result<BoxStream<'static, StagedEvent>, CaptureControlError> {
+		let mut client = self.connect().await?;
+		let response = client
+			.watch_staged_packets(WatchStagedPacketsRequest {})
+			.await
+			.map_err(classify_status)?;
+
+		let stream = response.into_inner().filter_map(|item| async move {
+			match item {
+				Ok(event) => match parse_staged_event(event) {
+					Ok(parsed) => Some(parsed),
+					Err(error) => {
+						log::warn!("dropping malformed staged event from hold-packet agent: {:?}", error);
+						None
+					}
+				},
+				Err(status) => {
+					log::warn!("dropping staged event due to stream status error: {}", status);
+					None
+				}
+			}
+		});
+
+		Ok(Box::pin(stream))
+	}
 }
 
 fn classify_status(status: tonic::Status) -> CaptureControlError {
 	match status.code() {
+		tonic::Code::NotFound => {
+			CaptureControlError::NotFound(format!("hold-packet agent resource not found: {status}"))
+		}
 		tonic::Code::InvalidArgument
 		| tonic::Code::FailedPrecondition
 		| tonic::Code::Unimplemented => CaptureControlError::Permanent(format!(
@@ -132,6 +174,33 @@ fn classify_status(status: tonic::Status) -> CaptureControlError {
 			"hold-packet agent call failed transiently: {status}"
 		)),
 	}
+}
+
+fn parse_staged_event(event: crate::holdpacket::StagedEvent) -> Result<StagedEvent, CaptureControlError> {
+	let src_ip = event
+		.src_ip
+		.parse::<IpAddr>()
+		.map_err(|e: AddrParseError| {
+			CaptureControlError::Permanent(format!(
+				"hold-packet agent returned invalid staged src_ip {:?}: {}",
+				event.src_ip, e
+			))
+		})?;
+	let dst_ip = event
+		.dst_ip
+		.parse::<IpAddr>()
+		.map_err(|e: AddrParseError| {
+			CaptureControlError::Permanent(format!(
+				"hold-packet agent returned invalid staged dst_ip {:?}: {}",
+				event.dst_ip, e
+			))
+		})?;
+
+	Ok(StagedEvent {
+		id: event.id,
+		src_ip,
+		dst_ip,
+	})
 }
 
 fn check_response(
@@ -157,6 +226,10 @@ pub struct FakeCaptureControl {
 	pub add_calls: Mutex<Vec<IpAddr>>,
 	pub remove_calls: Mutex<Vec<IpAddr>>,
 	pub replay_calls: Mutex<Vec<u64>>,
+	pub listed_rules: Mutex<Vec<IpAddr>>,
+	pub staged_events: Mutex<Vec<StagedEvent>>,
+	pub replay_results: Mutex<VecDeque<Result<(), CaptureControlError>>>,
+	pub watch_error: Mutex<Option<CaptureControlError>>,
 }
 
 #[cfg(test)]
@@ -166,6 +239,10 @@ impl FakeCaptureControl {
 			add_calls: Mutex::new(Vec::new()),
 			remove_calls: Mutex::new(Vec::new()),
 			replay_calls: Mutex::new(Vec::new()),
+			listed_rules: Mutex::new(Vec::new()),
+			staged_events: Mutex::new(Vec::new()),
+			replay_results: Mutex::new(VecDeque::new()),
+			watch_error: Mutex::new(None),
 		}
 	}
 }
@@ -184,12 +261,25 @@ impl CaptureControl for FakeCaptureControl {
 	}
 
 	async fn list_rules(&self) -> Result<Vec<IpAddr>, CaptureControlError> {
-		Ok(vec![])
+		Ok(self.listed_rules.lock().unwrap().clone())
 	}
 
 	async fn replay_rule(&self, id: u64) -> Result<(), CaptureControlError> {
 		self.replay_calls.lock().unwrap().push(id);
+		if let Some(result) = self.replay_results.lock().unwrap().pop_front() {
+			return result;
+		}
 		Ok(())
+	}
+
+	async fn watch_staged(&self) -> Result<BoxStream<'static, StagedEvent>, CaptureControlError> {
+		if let Some(error) = self.watch_error.lock().unwrap().take() {
+			return Err(error);
+		}
+
+		let events = self.staged_events.lock().unwrap().clone();
+		let stream = iter(events).chain(pending());
+		Ok(Box::pin(stream))
 	}
 }
 

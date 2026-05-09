@@ -8,6 +8,7 @@ service CapturelistService {
     rpc RemoveRule (RemoveRuleRequest) returns (RuleResponse);
     rpc ListRules (ListRulesRequest) returns (ListRulesResponse);
     rpc ReplayRule (ReplayRuleRequest) returns (RuleResponse);
+    rpc WatchStagedPackets (WatchStagedPacketsRequest) returns (stream StagedEvent);
 }
 
 message AddRuleRequest {
@@ -32,4 +33,12 @@ message ListRulesResponse {
 
 message ReplayRuleRequest {
     uint64 id = 1;
+}
+
+message WatchStagedPacketsRequest {}
+
+message StagedEvent {
+    uint64 id = 1;
+    string src_ip = 2;
+    string dst_ip = 3;
 }

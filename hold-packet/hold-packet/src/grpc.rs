@@ -1,9 +1,12 @@
- use std::net::IpAddr;
+use std::{net::IpAddr, pin::Pin};
 
+use tokio_stream::{Stream, StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
 use tonic::{Request, Response, Status};
 use hold_packet_common::StateEntry;
 use crate::{holdpacket::{
-    AddRuleRequest, ListRulesRequest, ListRulesResponse, RemoveRuleRequest, ReplayRuleRequest, RuleResponse, capturelist_service_server::CapturelistService
+    AddRuleRequest, ListRulesRequest, ListRulesResponse, RemoveRuleRequest, ReplayRuleRequest,
+    RuleResponse, StagedEvent as ProtoStagedEvent, WatchStagedPacketsRequest,
+    capturelist_service_server::CapturelistService,
 }, replay, capture_store::CaptureStore};
 use std::sync::Arc;
 
@@ -14,6 +17,8 @@ pub struct CapturelistServer {
 
 #[tonic::async_trait]
 impl CapturelistService for CapturelistServer {
+    type WatchStagedPacketsStream = Pin<Box<dyn Stream<Item = Result<ProtoStagedEvent, Status>> + Send + 'static>>;
+
     async fn add_rule(
         &self,
         request: Request<AddRuleRequest>,
@@ -59,10 +64,38 @@ impl CapturelistService for CapturelistServer {
             .collect();
         Ok(Response::new(ListRulesResponse { ips }))
     }
+
+    async fn watch_staged_packets(
+        &self,
+        _request: Request<WatchStagedPacketsRequest>,
+    ) -> Result<Response<Self::WatchStagedPacketsStream>, Status> {
+        let stream = BroadcastStream::new(self.replayer.subscribe()).filter_map(|result| {
+            match result {
+                Ok(event) => Some(Ok(ProtoStagedEvent {
+                    id: event.id,
+                    src_ip: event.src_ip.to_string(),
+                    dst_ip: event.dst_ip.to_string(),
+                })),
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    log::warn!("dropping {skipped} staged packet events due to slow stream consumer");
+                    None
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
     async fn replay_rule (&self, request: Request<ReplayRuleRequest>) -> Result<Response<RuleResponse>, Status> {
         let id = request.into_inner().id;
         self.replayer.replay_staged(id).await
-            .map_err(|e| Status::internal(format!("failed to replay staged packet: {e}")))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Status::not_found(format!("staged packet not found: {e}"))
+                } else {
+                    Status::internal(format!("failed to replay staged packet: {e}"))
+                }
+            })?;
         Ok(
             Response::new(RuleResponse {
                 success: true,

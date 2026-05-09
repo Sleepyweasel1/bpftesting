@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: completed
 
 # Trigger Replay from staged-packet events after scale-up
 
@@ -10,11 +10,11 @@ End-to-end: a TCP SYN arrives for a held IP → gets staged → Deployment scale
 
 ## Acceptance criteria
 
-- [ ] A streaming `WatchStagedPackets` RPC (or equivalent push mechanism) is added to `CapturelistService` proto and implemented in `grpc.rs`, backed by the `Replayer` broadcast channel.
-- [ ] `CaptureControl` trait gains a `watch_staged() -> impl Stream<Item=StagedEvent>` method; `HoldPacketClient` and `FakeCaptureControl` implement it.
-- [ ] The Reconciler calls `replay_rule` for each `StagedEvent` whose `dst_ip` matches a recently-woken Captured IP.
-- [ ] An integration test stages a synthetic frame, triggers a fake scale-up reconcile, and asserts `replay_rule` is called with the correct ID.
-- [ ] If `replay_rule` returns "not found" (packet pruned), the error is logged and skipped — not retried.
+- [x] A streaming `WatchStagedPackets` RPC (or equivalent push mechanism) is added to `CapturelistService` proto and implemented in `grpc.rs`, backed by the `Replayer` broadcast channel.
+- [x] `CaptureControl` trait gains a `watch_staged() -> impl Stream<Item=StagedEvent>` method; `HoldPacketClient` and `FakeCaptureControl` implement it.
+- [x] The Reconciler calls `replay_rule` for each `StagedEvent` whose `dst_ip` matches a recently-woken Captured IP.
+- [x] An integration test stages a synthetic frame, triggers a fake scale-up reconcile, and asserts `replay_rule` is called with the correct ID.
+- [x] If `replay_rule` returns "not found" (packet pruned), the error is logged and skipped — not retried.
 
 ## Blocked by
 
@@ -53,13 +53,28 @@ The operator should observe staged-packet notifications and invoke `replay_rule(
 - `replay_rule(id)` error handling — treats "not found" as non-fatal and non-retriable.
 
 **Acceptance criteria:**
-- [ ] A streaming `WatchStagedPackets` RPC (or equivalent push mechanism) is added to `CapturelistService` proto and implemented in `grpc.rs`, backed by the `Replayer` broadcast channel.
-- [ ] `CaptureControl` trait gains a `watch_staged() -> impl Stream<Item=StagedEvent>` method; `HoldPacketClient` and `FakeCaptureControl` implement it.
-- [ ] The Reconciler calls `replay_rule` for each `StagedEvent` whose `dst_ip` matches a recently-woken Captured IP.
-- [ ] An integration test stages a synthetic frame, triggers a fake scale-up reconcile, and asserts `replay_rule` is called with the correct ID.
-- [ ] If `replay_rule` returns "not found" (packet pruned), the error is logged and skipped — not retried.
+- [x] A streaming `WatchStagedPackets` RPC (or equivalent push mechanism) is added to `CapturelistService` proto and implemented in `grpc.rs`, backed by the `Replayer` broadcast channel.
+- [x] `CaptureControl` trait gains a `watch_staged() -> impl Stream<Item=StagedEvent>` method; `HoldPacketClient` and `FakeCaptureControl` implement it.
+- [x] The Reconciler calls `replay_rule` for each `StagedEvent` whose `dst_ip` matches a recently-woken Captured IP.
+- [x] An integration test stages a synthetic frame, triggers a fake scale-up reconcile, and asserts `replay_rule` is called with the correct ID.
+- [x] If `replay_rule` returns "not found" (packet pruned), the error is logged and skipped — not retried.
 
 **Out of scope:**
 - Reworking TAP frame parsing or Staging Area storage internals.
 - Adding durable event replay or persistence beyond the current in-process event stream.
 - Changing ScaleToZero membership reconciliation logic beyond consuming its wake/sleep outcomes.
+
+## Completion Notes
+
+- Added `WatchStagedPackets` streaming RPC and `StagedEvent`/`WatchStagedPacketsRequest` proto messages.
+- Implemented daemon-side stream fan-out in `grpc.rs` using the `Replayer` broadcast subscription, including lag handling.
+- Updated replay RPC error mapping so missing staged IDs return gRPC `NotFound`.
+- Extended `CaptureControl` with `watch_staged()` and introduced an operator-side `StagedEvent` model.
+- Implemented `watch_staged()` in both `HoldPacketClient` and `FakeCaptureControl`.
+- Wired reconcile scale-up (`RemoveCapture`) to drain staged events for recently-woken destination IPs and invoke `replay_rule(id)` for matching events.
+- Added non-fatal handling for `NotFound` replay outcomes (log and skip, no retry).
+- Added unit tests for scale-up replay matching and for skipping not-found replay errors.
+- Validation run:
+	- `cargo test -p hold-operator`
+	- `cargo test -p hold-packet --lib`
+	- `cargo test -p hold-packet --bin hold-packet --no-run`

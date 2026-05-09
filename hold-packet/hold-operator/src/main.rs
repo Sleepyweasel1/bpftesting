@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeSet, HashMap},
+	collections::{BTreeSet, HashMap, HashSet},
 	net::IpAddr,
 	sync::Arc,
 	time::Duration,
@@ -21,7 +21,7 @@ use kube::{
 		watcher,
 	},
 };
-use log::{error, info};
+use log::{error, info, warn};
 use rustls::crypto::ring::default_provider;
 use serde_json::json;
 
@@ -41,6 +41,8 @@ mod capture_control;
 
 const RECONCILE_REQUEUE_DELAY: Duration = Duration::from_secs(10);
 const AGENT_RETRY_BACKOFFS: [Duration; 2] = [Duration::from_millis(200), Duration::from_secs(1)];
+const STAGED_REPLAY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+const TRAFFIC_SIGNAL_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 struct OperatorContext {
@@ -206,6 +208,27 @@ struct ReconcileAssessment {
 	action: Action,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TrafficActivity {
+	Active,
+	Idle,
+}
+
+impl TrafficActivity {
+	fn as_str(self) -> &'static str {
+		match self {
+			TrafficActivity::Active => "Active",
+			TrafficActivity::Idle => "Idle",
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct TrafficSignal {
+	activity: TrafficActivity,
+	evidence: String,
+}
+
 async fn assess_reconcile(stz: &ScaleToZero, ctx: &OperatorContext) -> ReconcileAssessment {
 	assess_reconcile_with_readers(stz, ctx.state_reader.as_ref(), ctx.capture_control.as_ref()).await
 }
@@ -320,16 +343,48 @@ async fn assess_reconcile_with_readers(
 	};
 
 	match execute_agent_intent_for_ips(intent, &target_ips, capture_control).await {
-		Ok(()) => ReconcileAssessment {
-			intent,
-			outcome: ReconcileOutcome::Succeeded,
-			message: Some(format!(
-				"agent call succeeded: intent={intent:?} target_ips={}",
-				target_ips.join(",")
-			)),
-			action: Action::await_change(),
-		},
-		Err(CaptureControlError::Transient(message) | CaptureControlError::Permanent(message)) => {
+		Ok(()) => {
+			if intent == ReconcileIntent::RemoveCapture {
+				if let Err(error) = replay_recently_woken_staged_packets(&target_ips, capture_control).await {
+					return ReconcileAssessment {
+						intent,
+						outcome: ReconcileOutcome::RecoverableFailure,
+						message: Some(format!(
+							"failed replaying staged packets after wake transition: {}",
+							capture_control_error_message(&error)
+						)),
+						action: Action::requeue(RECONCILE_REQUEUE_DELAY),
+					};
+				}
+			}
+
+			let traffic_signal = match read_traffic_signal(intent, &target_ips, capture_control).await {
+				Ok(signal) => signal,
+				Err(message) => {
+					return ReconcileAssessment {
+						intent,
+						outcome: ReconcileOutcome::RecoverableFailure,
+						message: Some(message),
+						action: Action::requeue(RECONCILE_REQUEUE_DELAY),
+					};
+				}
+			};
+
+			ReconcileAssessment {
+				intent,
+				outcome: ReconcileOutcome::Succeeded,
+				message: Some(format!(
+					"agent call succeeded: intent={intent:?} target_ips={} traffic_signal={} evidence={}",
+					target_ips.join(","),
+					traffic_signal.activity.as_str(),
+					traffic_signal.evidence
+				)),
+				action: Action::await_change(),
+			}
+		}
+		Err(CaptureControlError::Transient(message)
+		| CaptureControlError::Permanent(message)
+		| CaptureControlError::NotFound(message)) => {
 			ReconcileAssessment {
 				intent,
 				outcome: ReconcileOutcome::RecoverableFailure,
@@ -337,6 +392,168 @@ async fn assess_reconcile_with_readers(
 				action: Action::requeue(RECONCILE_REQUEUE_DELAY),
 			}
 		}
+	}
+}
+
+async fn read_traffic_signal(
+	intent: ReconcileIntent,
+	target_ips: &[String],
+	capture_control: &dyn CaptureControl,
+) -> Result<TrafficSignal, String> {
+	let target_ip_set: HashSet<IpAddr> = target_ips
+		.iter()
+		.map(|ip| {
+			ip.parse::<IpAddr>()
+				.map_err(|error| format!("invalid target IP {ip:?} while reading traffic signal: {error}"))
+		})
+		.collect::<Result<_, _>>()?;
+
+	let listed_rules = capture_control
+		.list_rules()
+		.await
+		.map_err(|error| {
+			format!(
+				"traffic signal stale: failed reading capture rules from hold-packet agent: {}",
+				capture_control_error_message(&error)
+			)
+		})?;
+	let captured_target_count = listed_rules
+		.iter()
+		.filter(|ip| target_ip_set.contains(ip))
+		.count();
+
+	if intent == ReconcileIntent::HoldCapture && captured_target_count == 0 {
+		return Err(format!(
+			"traffic signal absent: none of target_ips={} are currently captured by hold-packet",
+			target_ips.join(",")
+		));
+	}
+
+	let mut staged_stream = capture_control.watch_staged().await.map_err(|error| {
+		format!(
+			"traffic signal stale: failed subscribing to staged packet stream: {}",
+			capture_control_error_message(&error)
+		)
+	})?;
+
+	let mut matched_event = None;
+	let deadline = tokio::time::Instant::now() + TRAFFIC_SIGNAL_POLL_TIMEOUT;
+	loop {
+		let now = tokio::time::Instant::now();
+		if now >= deadline {
+			break;
+		}
+
+		let remaining = deadline.saturating_duration_since(now);
+		match tokio::time::timeout(remaining, staged_stream.next()).await {
+			Ok(Some(event)) => {
+				if target_ip_set.contains(&event.dst_ip) {
+					matched_event = Some(event);
+					break;
+				}
+			}
+			Ok(None) => {
+				return Err(
+					"traffic signal stale: staged packet stream ended while polling decision evidence"
+						.to_owned(),
+				);
+			}
+			Err(_) => break,
+		}
+	}
+
+	if let Some(event) = matched_event {
+		return Ok(TrafficSignal {
+			activity: TrafficActivity::Active,
+			evidence: format!(
+				"matched staged packet id={} dst_ip={} captured_target_ips={}/{}",
+				event.id,
+				event.dst_ip,
+				captured_target_count,
+				target_ips.len()
+			),
+		});
+	}
+
+	Ok(TrafficSignal {
+		activity: TrafficActivity::Idle,
+		evidence: format!(
+			"no matching staged packet observed within {}ms; captured_target_ips={}/{}",
+			TRAFFIC_SIGNAL_POLL_TIMEOUT.as_millis(),
+			captured_target_count,
+			target_ips.len()
+		),
+	})
+}
+
+async fn replay_recently_woken_staged_packets(
+	recently_woken_ips: &[String],
+	capture_control: &dyn CaptureControl,
+) -> Result<(), CaptureControlError> {
+	let wake_set: HashSet<IpAddr> = recently_woken_ips
+		.iter()
+		.map(|ip| {
+			ip.parse::<IpAddr>().map_err(|error| {
+				CaptureControlError::Permanent(format!("invalid recently-woken IP {ip:?}: {error}"))
+			})
+		})
+		.collect::<Result<_, _>>()?;
+
+	if wake_set.is_empty() {
+		return Ok(());
+	}
+
+	let mut staged_stream = capture_control.watch_staged().await?;
+	let deadline = tokio::time::Instant::now() + STAGED_REPLAY_DRAIN_TIMEOUT;
+
+	loop {
+		let now = tokio::time::Instant::now();
+		if now >= deadline {
+			break;
+		}
+
+		let remaining = deadline.saturating_duration_since(now);
+		let next_event = match tokio::time::timeout(remaining, staged_stream.next()).await {
+			Ok(next_event) => next_event,
+			Err(_) => break,
+		};
+
+		let Some(event) = next_event else {
+			break;
+		};
+
+		if !wake_set.contains(&event.dst_ip) {
+			continue;
+		}
+
+		match capture_control.replay_rule(event.id).await {
+			Ok(()) => {
+				info!(
+					"replayed staged packet after wake: id={} dst_ip={}",
+					event.id,
+					event.dst_ip
+				);
+			}
+			Err(CaptureControlError::NotFound(message)) => {
+				warn!(
+					"skipping replay for pruned staged packet id={} dst_ip={} reason={}",
+					event.id,
+					event.dst_ip,
+					message
+				);
+			}
+			Err(error) => return Err(error),
+		}
+	}
+
+	Ok(())
+}
+
+fn capture_control_error_message(error: &CaptureControlError) -> &str {
+	match error {
+		CaptureControlError::Transient(message)
+		| CaptureControlError::Permanent(message)
+		| CaptureControlError::NotFound(message) => message.as_str(),
 	}
 }
 
@@ -449,7 +666,15 @@ async fn execute_agent_intent(
 			Err(CaptureControlError::Permanent(message)) => {
 				return Err(CaptureControlError::Permanent(message));
 			}
+			Err(CaptureControlError::NotFound(message)) => {
+				return Err(CaptureControlError::NotFound(message));
+			}
 			Err(CaptureControlError::Transient(message)) => {
+				if intent == ReconcileIntent::RemoveCapture
+					&& is_idempotent_remove_absence_error(&message)
+				{
+					return Ok(());
+				}
 				if attempt >= AGENT_RETRY_BACKOFFS.len() {
 					return Err(CaptureControlError::Transient(message));
 				}
@@ -458,6 +683,11 @@ async fn execute_agent_intent(
 			}
 		}
 	}
+}
+
+fn is_idempotent_remove_absence_error(message: &str) -> bool {
+	message.contains("remove failed")
+		&& message.contains("bpf_map_delete_elem failed")
 }
 
 fn build_reconciled_condition(
@@ -522,7 +752,7 @@ fn reconciled_condition_signature(conditions: &[Condition]) -> Option<(&str, &st
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::capture_control::FakeCaptureControl;
+	use crate::capture_control::{CaptureControlError, FakeCaptureControl, StagedEvent};
 	use hold_operator::stz::{ScaleToZeroSpec, TargetRef};
 	use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 	use serde_json::json;
@@ -656,9 +886,19 @@ mod tests {
 			services_error: None,
 		};
 		let capture = FakeCaptureControl::new();
+		capture.listed_rules.lock().unwrap().extend([
+			"10.96.0.1".parse::<IpAddr>().unwrap(),
+			"10.96.0.2".parse::<IpAddr>().unwrap(),
+			"fd00::100".parse::<IpAddr>().unwrap(),
+		]);
 
 		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
 		assert_eq!(assessment.outcome, ReconcileOutcome::Succeeded);
+		assert!(assessment
+			.message
+			.as_deref()
+			.expect("message should be present")
+			.contains("traffic_signal=Idle"));
 
 		let add_calls = capture.add_calls.lock().unwrap().clone();
 		assert_eq!(add_calls.len(), 3);
@@ -687,5 +927,151 @@ mod tests {
 		assert_eq!(remove_calls.len(), 2);
 		assert!(remove_calls.iter().any(|ip| ip.to_string() == "10.96.0.1"));
 		assert!(remove_calls.iter().any(|ip| ip.to_string() == "fd00::101"));
+	}
+
+	#[tokio::test]
+	async fn reconcile_scale_up_replays_matching_staged_packets() {
+		let stz = build_stz("default", "api");
+		let deployment = deployment_with_labels("api", 1, &[("app", "api")]);
+		let services = vec![service_with_selector("api", &[("app", "api")], &["10.96.0.1"])];
+		let reader = FakeKubeStateReader {
+			deployment: Some(deployment),
+			services,
+			deployment_error: None,
+			services_error: None,
+		};
+		let capture = FakeCaptureControl::new();
+		capture.staged_events.lock().unwrap().extend([
+			StagedEvent {
+				id: 7,
+				src_ip: "198.51.100.10".parse().unwrap(),
+				dst_ip: "10.96.0.1".parse().unwrap(),
+			},
+			StagedEvent {
+				id: 9,
+				src_ip: "198.51.100.11".parse().unwrap(),
+				dst_ip: "10.96.0.44".parse().unwrap(),
+			},
+		]);
+
+		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
+		assert_eq!(assessment.outcome, ReconcileOutcome::Succeeded);
+
+		let remove_calls = capture.remove_calls.lock().unwrap().clone();
+		assert_eq!(remove_calls.len(), 1);
+		assert_eq!(remove_calls[0].to_string(), "10.96.0.1");
+
+		let replay_calls = capture.replay_calls.lock().unwrap().clone();
+		assert_eq!(replay_calls, vec![7]);
+	}
+
+	#[tokio::test]
+	async fn reconcile_scale_up_skips_replay_not_found_errors() {
+		let stz = build_stz("default", "api");
+		let deployment = deployment_with_labels("api", 1, &[("app", "api")]);
+		let services = vec![service_with_selector("api", &[("app", "api")], &["10.96.0.1"])];
+		let reader = FakeKubeStateReader {
+			deployment: Some(deployment),
+			services,
+			deployment_error: None,
+			services_error: None,
+		};
+		let capture = FakeCaptureControl::new();
+		capture.staged_events.lock().unwrap().push(StagedEvent {
+			id: 11,
+			src_ip: "198.51.100.12".parse().unwrap(),
+			dst_ip: "10.96.0.1".parse().unwrap(),
+		});
+		capture.replay_results.lock().unwrap().push_back(Err(CaptureControlError::NotFound(
+			"staged packet id not found".to_owned(),
+		)));
+
+		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
+		assert_eq!(assessment.outcome, ReconcileOutcome::Succeeded);
+
+		let replay_calls = capture.replay_calls.lock().unwrap().clone();
+		assert_eq!(replay_calls, vec![11]);
+	}
+
+	#[tokio::test]
+	async fn reconcile_scale_down_records_active_signal_evidence() {
+		let stz = build_stz("default", "api");
+		let deployment = deployment_with_labels("api", 0, &[("app", "api")]);
+		let services = vec![service_with_selector("api", &[("app", "api")], &["10.96.0.1"])];
+		let reader = FakeKubeStateReader {
+			deployment: Some(deployment),
+			services,
+			deployment_error: None,
+			services_error: None,
+		};
+		let capture = FakeCaptureControl::new();
+		capture
+			.listed_rules
+			.lock()
+			.unwrap()
+			.push("10.96.0.1".parse().unwrap());
+		capture.staged_events.lock().unwrap().push(StagedEvent {
+			id: 44,
+			src_ip: "198.51.100.40".parse().unwrap(),
+			dst_ip: "10.96.0.1".parse().unwrap(),
+		});
+
+		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
+		assert_eq!(assessment.outcome, ReconcileOutcome::Succeeded);
+		let message = assessment.message.expect("message should be present");
+		assert!(message.contains("traffic_signal=Active"));
+		assert!(message.contains("id=44"));
+	}
+
+	#[tokio::test]
+	async fn reconcile_scale_down_fails_when_traffic_signal_absent() {
+		let stz = build_stz("default", "api");
+		let deployment = deployment_with_labels("api", 0, &[("app", "api")]);
+		let services = vec![service_with_selector("api", &[("app", "api")], &["10.96.0.1"])];
+		let reader = FakeKubeStateReader {
+			deployment: Some(deployment),
+			services,
+			deployment_error: None,
+			services_error: None,
+		};
+		let capture = FakeCaptureControl::new();
+
+		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
+		assert_eq!(assessment.outcome, ReconcileOutcome::RecoverableFailure);
+		assert!(assessment
+			.message
+			.as_deref()
+			.expect("message should be present")
+			.contains("traffic signal absent"));
+	}
+
+	#[tokio::test]
+	async fn reconcile_scale_down_fails_when_traffic_signal_is_stale() {
+		let stz = build_stz("default", "api");
+		let deployment = deployment_with_labels("api", 0, &[("app", "api")]);
+		let services = vec![service_with_selector("api", &[("app", "api")], &["10.96.0.1"])];
+		let reader = FakeKubeStateReader {
+			deployment: Some(deployment),
+			services,
+			deployment_error: None,
+			services_error: None,
+		};
+		let capture = FakeCaptureControl::new();
+		capture
+			.listed_rules
+			.lock()
+			.unwrap()
+			.push("10.96.0.1".parse().unwrap());
+		*capture.watch_error.lock().unwrap() = Some(CaptureControlError::Transient(
+			"stream temporarily unavailable".to_owned(),
+		));
+
+		let assessment = assess_reconcile_with_readers(&stz, &reader, &capture).await;
+		assert_eq!(assessment.outcome, ReconcileOutcome::RecoverableFailure);
+		assert!(assessment
+			.message
+			.as_deref()
+			.expect("message should be present")
+			.contains("traffic signal stale"));
 	}
 }

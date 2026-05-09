@@ -27,6 +27,15 @@ impl std::fmt::Display for CaptureStoreError {
 
 impl std::error::Error for CaptureStoreError {}
 
+fn is_not_found_error(err: &str) -> bool {
+    err.contains("not found")
+        || err.contains("no entry")
+    || err.contains("No such file or directory")
+    || err.contains("key does not exist")
+        || err.contains("ENOENT")
+        || err.contains("os error 2")
+}
+
 /// Encapsulates dual IPv4/IPv6 eBPF state maps behind a unified interface.
 /// 
 /// The `CaptureStore` seam abstracts away the dual-map (`STATEV4`/`STATEV6`) split
@@ -71,14 +80,60 @@ impl CaptureStore {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
                 let mut map = self.state_v4.write().await;
-                map.remove(&addr)
-                    .map_err(|e| CaptureStoreError::RemoveFailed(e.to_string()))?;
+                match map.get(&addr, 0) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if is_not_found_error(&err_str) {
+                            return Ok(());
+                        }
+                        return Err(CaptureStoreError::GetFailed(err_str));
+                    }
+                }
+
+                if let Err(e) = map.remove(&addr) {
+                    let err_str = e.to_string();
+                    match map.get(&addr, 0) {
+                        Ok(_) => return Err(CaptureStoreError::RemoveFailed(err_str)),
+                        Err(verify_err) => {
+                            let verify_err_str = verify_err.to_string();
+                            if !is_not_found_error(&verify_err_str) {
+                                return Err(CaptureStoreError::RemoveFailed(format!(
+                                    "{err_str}; post-delete verification failed: {verify_err_str}"
+                                )));
+                            }
+                        }
+                    }
+                }
             }
             IpAddr::V6(v6) => {
                 let addr: u128 = v6.into();
                 let mut map = self.state_v6.write().await;
-                map.remove(&addr)
-                    .map_err(|e| CaptureStoreError::RemoveFailed(e.to_string()))?;
+                match map.get(&addr, 0) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if is_not_found_error(&err_str) {
+                            return Ok(());
+                        }
+                        return Err(CaptureStoreError::GetFailed(err_str));
+                    }
+                }
+
+                if let Err(e) = map.remove(&addr) {
+                    let err_str = e.to_string();
+                    match map.get(&addr, 0) {
+                        Ok(_) => return Err(CaptureStoreError::RemoveFailed(err_str)),
+                        Err(verify_err) => {
+                            let verify_err_str = verify_err.to_string();
+                            if !is_not_found_error(&verify_err_str) {
+                                return Err(CaptureStoreError::RemoveFailed(format!(
+                                    "{err_str}; post-delete verification failed: {verify_err_str}"
+                                )));
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -97,7 +152,7 @@ impl CaptureStore {
                         let err_str = e.to_string();
                         // Check if this is a "key not found" error (common pattern in aya).
                         // If it's truly a retrieval error (not just missing key), treat as error.
-                        if err_str.contains("not found") || err_str.contains("no entry") {
+                        if is_not_found_error(&err_str) {
                             Ok(None)
                         } else {
                             Err(CaptureStoreError::GetFailed(err_str))
@@ -112,7 +167,7 @@ impl CaptureStore {
                     Ok(entry) => Ok(Some(entry)),
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("not found") || err_str.contains("no entry") {
+                        if is_not_found_error(&err_str) {
                             Ok(None)
                         } else {
                             Err(CaptureStoreError::GetFailed(err_str))
@@ -161,8 +216,6 @@ impl CaptureStore {
         ip: IpAddr,
         new_mode: hold_packet_common::CaptureMode,
     ) -> Result<bool, CaptureStoreError> {
-        use hold_packet_common::CaptureMode;
-
         match ip {
             IpAddr::V4(v4) => {
                 let addr: u32 = v4.into();
@@ -176,7 +229,7 @@ impl CaptureStore {
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("not found") || err_str.contains("no entry") {
+                        if is_not_found_error(&err_str) {
                             Ok(false) // Idempotent: IP not present
                         } else {
                             Err(CaptureStoreError::GetFailed(err_str))
@@ -196,7 +249,7 @@ impl CaptureStore {
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("not found") || err_str.contains("no entry") {
+                        if is_not_found_error(&err_str) {
                             Ok(false)
                         } else {
                             Err(CaptureStoreError::GetFailed(err_str))
