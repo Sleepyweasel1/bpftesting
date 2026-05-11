@@ -11,7 +11,8 @@ use futures::{StreamExt, stream::{BoxStream, iter, pending}};
 use tonic::transport::Endpoint;
 
 use crate::holdpacket::{
-	AddRuleRequest, ListRulesRequest, RemoveRuleRequest, ReplayRuleRequest,
+	AddRuleRequest, CaptureMode, GetIdleStatusRequest, IdleCaptureStatus as ProtoIdleCaptureStatus,
+	ListRulesRequest, RemoveRuleRequest, ReplayRuleRequest,
 	WatchStagedPacketsRequest,
 	capturelist_service_client::CapturelistServiceClient,
 };
@@ -36,6 +37,36 @@ pub struct StagedEvent {
 	pub dst_ip: IpAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStatusKind {
+	Active,
+	Idle,
+	UnknownNotCaptured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleStatus {
+	pub ip: IpAddr,
+	pub status: IdleStatusKind,
+	pub last_seen_ns: u64,
+	pub packet_count: u64,
+	pub exceeds_idle_timeout: bool,
+	pub mode: IdleStatusMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStatusMode {
+	PassThrough,
+	Hold,
+	Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleStatusSnapshot {
+	pub idle_timeout_ns: u64,
+	pub statuses: Vec<IdleStatus>,
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -45,6 +76,7 @@ pub trait CaptureControl: Send + Sync {
 	async fn add_rule(&self, ip: IpAddr) -> Result<(), CaptureControlError>;
 	async fn remove_rule(&self, ip: IpAddr) -> Result<(), CaptureControlError>;
 	async fn list_rules(&self) -> Result<Vec<IpAddr>, CaptureControlError>;
+	async fn get_idle_statuses(&self, ips: &[IpAddr]) -> Result<IdleStatusSnapshot, CaptureControlError>;
 	async fn replay_rule(&self, id: u64) -> Result<(), CaptureControlError>;
 	async fn watch_staged(&self) -> Result<BoxStream<'static, StagedEvent>, CaptureControlError>;
 }
@@ -119,6 +151,28 @@ impl CaptureControl for HoldPacketClient {
 				})
 			})
 			.collect()
+	}
+
+	async fn get_idle_statuses(&self, ips: &[IpAddr]) -> Result<IdleStatusSnapshot, CaptureControlError> {
+		let mut client = self.connect().await?;
+		let response = client
+			.get_idle_status(GetIdleStatusRequest {
+				ips: ips.iter().map(ToString::to_string).collect(),
+			})
+			.await
+			.map_err(classify_status)?;
+
+		let body = response.into_inner();
+		let statuses = body
+			.statuses
+			.into_iter()
+			.map(parse_idle_status)
+			.collect::<Result<Vec<_>, _>>()?;
+
+		Ok(IdleStatusSnapshot {
+			idle_timeout_ns: body.idle_timeout_ns,
+			statuses,
+		})
 	}
 
 	async fn replay_rule(&self, id: u64) -> Result<(), CaptureControlError> {
@@ -203,6 +257,47 @@ fn parse_staged_event(event: crate::holdpacket::StagedEvent) -> Result<StagedEve
 	})
 }
 
+fn parse_idle_status(event: crate::holdpacket::IpIdleStatus) -> Result<IdleStatus, CaptureControlError> {
+	let ip = event.ip.parse::<IpAddr>().map_err(|e: AddrParseError| {
+		CaptureControlError::Permanent(format!(
+			"hold-packet agent returned invalid idle status ip {:?}: {}",
+			event.ip, e
+		))
+	})?;
+
+	let status = match ProtoIdleCaptureStatus::try_from(event.status).map_err(|_| {
+		CaptureControlError::Permanent(format!(
+			"hold-packet agent returned invalid idle status discriminant {} for ip {}",
+			event.status, ip
+		))
+	})? {
+		ProtoIdleCaptureStatus::Active => IdleStatusKind::Active,
+		ProtoIdleCaptureStatus::Idle => IdleStatusKind::Idle,
+		ProtoIdleCaptureStatus::UnknownNotCaptured
+		| ProtoIdleCaptureStatus::Unspecified => IdleStatusKind::UnknownNotCaptured,
+	};
+
+	let mode = match CaptureMode::try_from(event.mode).map_err(|_| {
+		CaptureControlError::Permanent(format!(
+			"hold-packet agent returned invalid capture mode discriminant {} for ip {}",
+			event.mode, ip
+		))
+	})? {
+		CaptureMode::PassThrough => IdleStatusMode::PassThrough,
+		CaptureMode::Hold => IdleStatusMode::Hold,
+		CaptureMode::Unspecified => IdleStatusMode::Unknown,
+	};
+
+	Ok(IdleStatus {
+		ip,
+		status,
+		last_seen_ns: event.last_seen_ns,
+		packet_count: event.packet_count,
+		exceeds_idle_timeout: event.exceeds_idle_timeout,
+		mode,
+	})
+}
+
 fn check_response(
 	body: crate::holdpacket::RuleResponse,
 ) -> Result<(), CaptureControlError> {
@@ -227,9 +322,12 @@ pub struct FakeCaptureControl {
 	pub remove_calls: Mutex<Vec<IpAddr>>,
 	pub replay_calls: Mutex<Vec<u64>>,
 	pub listed_rules: Mutex<Vec<IpAddr>>,
+	pub idle_statuses: Mutex<Vec<IdleStatus>>,
+	pub idle_timeout_ns: Mutex<u64>,
 	pub staged_events: Mutex<Vec<StagedEvent>>,
 	pub replay_results: Mutex<VecDeque<Result<(), CaptureControlError>>>,
 	pub watch_error: Mutex<Option<CaptureControlError>>,
+	pub idle_error: Mutex<Option<CaptureControlError>>,
 }
 
 #[cfg(test)]
@@ -240,9 +338,12 @@ impl FakeCaptureControl {
 			remove_calls: Mutex::new(Vec::new()),
 			replay_calls: Mutex::new(Vec::new()),
 			listed_rules: Mutex::new(Vec::new()),
+			idle_statuses: Mutex::new(Vec::new()),
+			idle_timeout_ns: Mutex::new(0),
 			staged_events: Mutex::new(Vec::new()),
 			replay_results: Mutex::new(VecDeque::new()),
 			watch_error: Mutex::new(None),
+			idle_error: Mutex::new(None),
 		}
 	}
 }
@@ -262,6 +363,36 @@ impl CaptureControl for FakeCaptureControl {
 
 	async fn list_rules(&self) -> Result<Vec<IpAddr>, CaptureControlError> {
 		Ok(self.listed_rules.lock().unwrap().clone())
+	}
+
+	async fn get_idle_statuses(&self, ips: &[IpAddr]) -> Result<IdleStatusSnapshot, CaptureControlError> {
+		if let Some(error) = self.idle_error.lock().unwrap().take() {
+			return Err(error);
+		}
+
+		let configured = self.idle_statuses.lock().unwrap().clone();
+		let statuses = ips
+			.iter()
+			.map(|ip| {
+				configured
+					.iter()
+					.find(|status| status.ip == *ip)
+					.cloned()
+					.unwrap_or(IdleStatus {
+						ip: *ip,
+						status: IdleStatusKind::UnknownNotCaptured,
+						last_seen_ns: 0,
+						packet_count: 0,
+						exceeds_idle_timeout: false,
+						mode: IdleStatusMode::Unknown,
+					})
+			})
+			.collect();
+
+		Ok(IdleStatusSnapshot {
+			idle_timeout_ns: *self.idle_timeout_ns.lock().unwrap(),
+			statuses,
+		})
 	}
 
 	async fn replay_rule(&self, id: u64) -> Result<(), CaptureControlError> {

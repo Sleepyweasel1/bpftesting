@@ -122,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&shared_statelistv6),
     ));
 
+    let idle_timeout_ns = idle_timeout_secs.saturating_mul(1_000_000_000);
     spawn_idle_monitor(
         Arc::clone(&capture_store),
         idle_timeout_secs,
@@ -143,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
     let svc = CapturelistServiceServer::new(CapturelistServer {
             capture_store: Arc::clone(&capture_store),
             replayer: Arc::clone(&replayer),
+            idle_timeout_ns,
     });
     tokio::task::spawn(async move {
         if let Err(e) = Server::builder().add_service(svc).serve(grpc_addr).await {

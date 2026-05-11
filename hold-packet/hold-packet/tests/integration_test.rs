@@ -21,6 +21,8 @@ pub mod holdpacket {
 
 use holdpacket::{
     AddRuleRequest,
+    GetIdleStatusRequest,
+    IdleCaptureStatus,
     ReplayRuleRequest,
     capturelist_service_client::CapturelistServiceClient,
 };
@@ -754,4 +756,83 @@ async fn test_userspace_replay_blackbox_e2e() {
     // Replaying the same packet a second time must fail because it is consumed.
     let second = client.replay_rule(ReplayRuleRequest { id: staged_id }).await;
     assert!(second.is_err(), "second replay call should fail for consumed id");
+}
+
+#[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore = "eBPF integration tests require Linux")]
+async fn test_idle_status_rpc_reports_active_unknown_and_is_deterministic() {
+    // Root is required for tc attachment and loading eBPF programs.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("Skipping test_idle_status_rpc_reports_active_unknown_and_is_deterministic: requires root");
+        return;
+    }
+
+    let fixture = VethFixture::new();
+
+    let bind = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("failed to reserve ephemeral gRPC port");
+    let grpc_port = bind.local_addr().expect("failed to read local addr").port();
+    drop(bind);
+
+    let grpc_addr = format!("127.0.0.1:{grpc_port}");
+    let grpc_endpoint = format!("http://{grpc_addr}");
+
+    let mut userspace = ChildGuard::spawn_hold_packet(&fixture.iface_ingress, &grpc_addr);
+    wait_for_grpc(&grpc_endpoint, Duration::from_secs(8)).await;
+
+    let mut client = CapturelistServiceClient::connect(grpc_endpoint.clone())
+        .await
+        .expect("failed to connect to userspace gRPC server");
+
+    client
+        .add_rule(AddRuleRequest {
+            ip: "10.200.1.1".to_owned(),
+        })
+        .await
+        .expect("add_rule IPv4 RPC failed");
+    client
+        .add_rule(AddRuleRequest {
+            ip: "fd00::100".to_owned(),
+        })
+        .await
+        .expect("add_rule IPv6 RPC failed");
+
+    let request = GetIdleStatusRequest {
+        ips: vec![
+            "10.200.1.1".to_owned(),
+            "fd00::100".to_owned(),
+            "10.200.1.99".to_owned(),
+        ],
+    };
+
+    let first = client
+        .get_idle_status(request.clone())
+        .await
+        .expect("get_idle_status RPC failed")
+        .into_inner();
+    let second = client
+        .get_idle_status(request)
+        .await
+        .expect("second get_idle_status RPC failed")
+        .into_inner();
+
+    assert_eq!(first.statuses, second.statuses, "repeated reads should be deterministic");
+    assert_eq!(first.idle_timeout_ns, second.idle_timeout_ns);
+    assert_eq!(first.statuses.len(), 3);
+
+    assert_eq!(
+        first.statuses[0].status,
+        IdleCaptureStatus::Active as i32
+    );
+    assert_eq!(
+        first.statuses[1].status,
+        IdleCaptureStatus::Active as i32
+    );
+    assert_eq!(
+        first.statuses[2].status,
+        IdleCaptureStatus::UnknownNotCaptured as i32
+    );
+
+    // Keep the child alive for the full test scope.
+    assert!(userspace.try_wait().is_none(), "userspace should still be running");
 }

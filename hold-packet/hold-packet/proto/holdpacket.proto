@@ -7,6 +7,7 @@ service CapturelistService {
     rpc AddRule (AddRuleRequest) returns (RuleResponse);
     rpc RemoveRule (RemoveRuleRequest) returns (RuleResponse);
     rpc ListRules (ListRulesRequest) returns (ListRulesResponse);
+    rpc GetIdleStatus (GetIdleStatusRequest) returns (GetIdleStatusResponse);
     rpc ReplayRule (ReplayRuleRequest) returns (RuleResponse);
     rpc WatchStagedPackets (WatchStagedPacketsRequest) returns (stream StagedEvent);
 }
@@ -29,6 +30,39 @@ message ListRulesRequest {}
 
 message ListRulesResponse {
     repeated string ips = 1;
+}
+
+message GetIdleStatusRequest {
+    // IPv4/IPv6 addresses in string form.
+    repeated string ips = 1;
+}
+
+message GetIdleStatusResponse {
+    // Echo of daemon idle timeout so callers can log evaluation context.
+    uint64 idle_timeout_ns = 1;
+    repeated IpIdleStatus statuses = 2;
+}
+
+message IpIdleStatus {
+    string ip = 1;
+    IdleCaptureStatus status = 2;
+    uint64 last_seen_ns = 3;
+    uint64 packet_count = 4;
+    CaptureMode mode = 5;
+    bool exceeds_idle_timeout = 6;
+}
+
+enum IdleCaptureStatus {
+    IDLE_CAPTURE_STATUS_UNSPECIFIED = 0;
+    IDLE_CAPTURE_STATUS_ACTIVE = 1;
+    IDLE_CAPTURE_STATUS_IDLE = 2;
+    IDLE_CAPTURE_STATUS_UNKNOWN_NOT_CAPTURED = 3;
+}
+
+enum CaptureMode {
+    CAPTURE_MODE_UNSPECIFIED = 0;
+    CAPTURE_MODE_PASS_THROUGH = 1;
+    CAPTURE_MODE_HOLD = 2;
 }
 
 message ReplayRuleRequest {
